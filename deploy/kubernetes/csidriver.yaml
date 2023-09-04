@@ -1,0 +1,7 @@
+apiVersion: trl.ibm.com/v1alpha1
+kind: ObjcacheCsiDriver
+metadata:
+  name: objcache-csi
+  namespace: objcache-operator-system
+spec:
+  serviceAccount: objcache-csi-sa

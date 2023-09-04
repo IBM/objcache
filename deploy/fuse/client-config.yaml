@@ -1,0 +1,12 @@
+maxRetry: 100
+debugFuse: true
+debugS3: false
+blockProfileRate: 0
+mutexProfileRate: 0
+cosPrefetchSize: 2Gi
+clientReadAheadSize: 256Mi #64Mi
+remoteCacheSize: 32Mi
+chunkCacheSize: 0
+useNotifyStore: false
+uploadParallel: 64
+disableLocalWriteBackCaching: false

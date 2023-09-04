@@ -1,0 +1,22 @@
+apiVersion: trl.ibm.com/v1alpha1
+kind: ObjcacheCluster
+metadata:
+  name: objcache-sample
+spec:
+  generatedStorageClassName: objcache-sample
+  shards: 1
+  raftFollowers: 0
+  seed: 202305101353
+  secret: objcache-secret
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: objcache-sample-pvc
+spec:
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: objcache-sample

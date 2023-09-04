@@ -1,0 +1,5 @@
+## Append samples you want in your CSV to this file as resources ##
+resources:
+- trl_v1alpha1_objcachecluster.yaml
+- trl_v1alpha1_objcachecsidriver.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples

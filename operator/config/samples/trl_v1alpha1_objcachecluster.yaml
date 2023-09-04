@@ -1,0 +1,12 @@
+apiVersion: trl.ibm.com/v1alpha1
+kind: ObjcacheCluster
+metadata:
+  labels:
+    app.kubernetes.io/name: objcachecluster
+    app.kubernetes.io/instance: objcachecluster-sample
+    app.kubernetes.io/part-of: objcache-operator
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/created-by: objcache-operator
+  name: objcachecluster-sample
+spec:
+  # TODO(user): Add fields here

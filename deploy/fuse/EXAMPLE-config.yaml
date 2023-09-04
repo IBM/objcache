@@ -1,0 +1,26 @@
+mountOptions:
+  allow_other: ""
+dirMode: 0755
+fileMode: 0644
+uid: 1000
+gid: 1000
+cacheCapacity: 40Gi
+chunkSize: 5Mi
+maxDataConn: 100
+rpcChunkSize: 64Ki
+maxRetry: 100
+debugFuse: true
+debugS3: false
+blockProfileRate: 0
+mutexProfileRate: 0
+heartBeatInterval: 15ms
+electTimeout: 150ms
+shutdownTimeout: 1m
+evictionInterval: 1s
+dirtyExpireInterval: 24h
+rpcTimeout: 15ms
+chunkRpcTimeout: 30ms
+commitRpcTimeout: 15ms
+coordinatorTimeout: 50ms
+mpuTimeout: 25s
+persistTimeout: 833s

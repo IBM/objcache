@@ -1,0 +1,9 @@
+*~
+go.sum
+bin
+.idea
+.vscode
+*.pb.go
+secret.yaml
+config.yaml
+__pycache__

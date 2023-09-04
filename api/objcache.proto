@@ -1,0 +1,73 @@
+/*
+ * Copyright 2023- IBM Inc. All rights reserved
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+syntax = "proto3";
+package proto;
+option go_package = ".;api";
+
+enum Reply {
+  Invalid = 0;
+  Ok = 100;
+	Fail = 101;
+	NotLeader = 102;
+	Timeout = 103;
+	Continue = 105;
+	MismatchVer = 106;
+	Retry = 107;
+	Voting = 110;
+	NoGroup = 111;
+	Ext = 1000;
+}
+
+message Void {}
+
+message ApiRet {
+  int32 Status = 1;
+}
+
+message RequestJoinArgs {
+  string TargetAddr = 1;
+  int32 TargetPort = 2;
+}
+
+message RequestLeaveArgs {
+  bytes Ip = 1;
+  int32 Port = 2;
+  uint32 NodeId = 3;
+}
+
+message GetConfigRet {
+  int32 Status = 1;
+  bytes LeaderIp = 2;
+  int32 LeaderPort = 3;
+  bytes ConfigBytes = 4;
+}
+
+message ApiNodeMsg {
+  bytes Addr = 1;
+  int32 Port = 2;
+  uint32 NodeId = 3;
+  string GroupId = 4;
+}
+
+message GetTrackerNodeRet {
+  int32 Status = 1;
+  ApiNodeMsg Leader = 2;
+  uint64 NodeListVer = 3;
+  repeated ApiNodeMsg Nodes = 4;
+}
+
+service ObjcacheApi {
+  rpc IsReady (Void) returns (ApiRet) {}
+  rpc DropCache (Void) returns (ApiRet) {}
+  rpc Terminate (Void) returns (Void) {}
+  rpc RequestJoin (RequestJoinArgs) returns (ApiRet) {}
+  rpc RequestRemoveNode (RequestLeaveArgs) returns (ApiRet) {}
+  rpc Panic (Void) returns (Void) {}
+  rpc CoreDump (Void) returns (Void) {}
+  rpc Rejuvenate (Void) returns (ApiRet) {}
+  rpc GetConfig (Void) returns (GetConfigRet) {}
+  rpc GetTrackerNode (Void) returns (GetTrackerNodeRet) {}
+}

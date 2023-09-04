@@ -1,0 +1,812 @@
+/*
+ * Copyright 2023- IBM Inc. All rights reserved
+ * SPDX-License-Identifier: Apache-2.0
+ */
+ 
+syntax = "proto3";
+package proto;
+option go_package = ".;common";
+
+message LeaderNodeMsg {
+  bytes Addr = 1;
+  int32 Port = 2;
+  uint32 NodeId = 3;
+}
+
+message DeleteInodeMapArgs {
+  repeated uint64 InodeKey = 1;
+  repeated string Key = 2;
+}
+
+message Ack {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+}
+
+message GetApiPortArgs {}
+
+message GetApiPortRet {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  int32 ApiPort = 3;
+}
+
+message TxIdMsg {
+  uint32 ClientId = 1;
+  uint32 SeqNum = 2;
+  uint64 TxSeqNum = 3;
+}
+
+message MigrationIdMsg {
+  uint32 ClientId = 1;
+  uint32 SeqNum = 2;
+}
+
+/* messages to get meta */
+
+message GetMetaAnyArgs {
+  string Key = 1;
+  uint64 InodeKey = 2;
+  int64 ChunkSize = 3;
+  uint64 ParentInodeKey = 4;
+  uint32 ParentMode = 5;
+  uint64 NodeListVer = 6;
+  int32 ExpireMs = 7;
+}
+
+message GetWorkingMetaRet {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  CopiedMetaMsg Meta = 3;
+  string MetaKey = 4;
+}
+
+message CopiedMetaChildMsg {
+  string Name = 1;
+  uint64 InodeKey = 2;
+  uint32 Mode = 3;
+}
+
+message CopiedMetaMsg {
+  uint64 InodeKey = 1;
+  uint64 ParentKey = 2;
+  uint32 Version = 3;
+  int64 ChunkSize = 4;
+  int64 Size = 5;
+  int64 LastModified = 6;
+  int32 ExpireMs = 7;
+  uint32 Mode = 8;
+  repeated CopiedMetaChildMsg Children = 9;
+  string FetchKey = 10;
+}
+
+message UpdateMetaAttrMsg {
+  uint64 InodeKey = 1;
+  uint32 Mode = 2;
+  int64 Ts = 3;
+}
+
+message MetaRWHandlerMsg {
+  uint64 InodeKey = 1;
+  uint32 Version = 2;
+  int64 ChunkSize = 3;
+  int64 Size = 4;
+  int64 MTime = 5;
+  uint32 Mode = 6;
+}
+
+message DownloadChunkArgs {
+  MetaRWHandlerMsg Handler = 1;
+  string Key = 2;
+  int64 Offset = 3;
+  int32 Length = 4;
+}
+
+message DownloadChunkRet {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  int32 Count = 3;
+}
+
+message PrefetchChunkArgs {
+  MetaRWHandlerMsg Handler = 1;
+  string Key = 2;
+  int64 Offset = 3;
+  int64 Length = 4;
+  uint64 NodeListVer = 5;
+}
+
+/* messages to update chunks */
+
+message UpdateChunkArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  int64 Offset = 4;
+  int64 ChunkSize = 5;
+}
+
+message StagingChunkMsg {
+  TxIdMsg TxId = 1;
+  int64 Offset = 2;
+  int64 Length = 3;
+  int64 FileOffset = 4;
+}
+
+message UpdateChunkRet {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  StagingChunkMsg Stag = 3;
+}
+
+message CommitUpdateChunksArgs {
+  CopiedMetaMsg Meta = 1;
+  CopiedMetaMsg Prev = 2;
+  UpdateChunkRecordMsg Chunk = 3;
+  TxIdMsg TxId = 4;
+  uint64 NodeListVer = 5;
+}
+
+message CommitDeleteChunkArgs {
+  TxIdMsg TxId = 1;
+  CopiedMetaMsg Meta = 2;
+  CopiedMetaMsg Prev = 3;
+  int64 Offset = 4;
+  int64 DeleteLength = 5;
+  uint64 NodeListVer = 6;
+}
+
+message CommitExpandChunkArgs {
+  TxIdMsg TxId = 1;
+  CopiedMetaMsg Meta = 2;
+  CopiedMetaMsg Prev = 3;
+  int64 Offset = 4;
+  int64 ExpandLength = 5;
+  uint64 NodeListVer = 6;
+}
+
+/* messages for Tx coordinator */
+
+message CoordinatorIdMsg {
+  uint32 ClientId = 1;
+  uint32 SeqNum = 2;
+}
+
+message CoordinatorRetMsg {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  CopiedMetaMsg Meta = 3;
+  repeated CopiedMetaMsg Parent = 4;
+  int32 ExtReply = 5;
+}
+
+message UpdateChunkRecordMsg {
+  string GroupId = 1;
+  repeated StagingChunkMsg Stags = 2;
+}
+
+message FlushObjectArgs {
+  CoordinatorIdMsg Id = 1;
+  uint64 NodeListVer = 2;
+  uint64 InodeKey = 4;
+  int64 MTime = 5;
+  uint32 Mode = 6;
+  repeated UpdateChunkRecordMsg Records = 7;
+}
+
+message TruncateObjectArgs {
+  CoordinatorIdMsg Id = 1;
+  uint64 NodeListVer = 2;
+  uint64 InodeKey = 3;
+  int64 NewSize = 4;
+}
+
+message DeleteObjectArgs {
+  uint64 NodeListVer = 1;
+  CoordinatorIdMsg Id = 2;
+  uint64 ParentInodeKey = 3;
+  string ChildName = 4;
+  uint64 ChildInodeKey = 5;
+  string ParentFullPath = 6;
+}
+
+message HardLinkObjectArgs {
+  CoordinatorIdMsg Id = 1;
+  uint64 NodeListVer = 2;
+  uint64 SrcInodeKey = 3;
+  CopiedMetaChildMsg SrcParent = 4;
+  string DstParentKey = 5;
+  uint64 DstParentInodeKey = 6;
+  CopiedMetaChildMsg ChildAttr = 7;
+}
+
+message RenameObjectArgs {
+  CoordinatorIdMsg Id = 1;
+  uint64 NodeListVer = 2;
+  string SrcParentKey = 3;
+  CopiedMetaChildMsg SrcParent = 4;
+  string SrcName = 5;
+  string DstParentKey = 6;
+  uint64 DstParentInodeKey = 7;
+  CopiedMetaChildMsg ChildAttr = 8;
+}
+
+message CreateObjectArgs {
+  CoordinatorIdMsg Id = 1;
+  uint64 NodeListVer = 2;
+  string ParentFullPath = 3;
+  CopiedMetaChildMsg ParentAttr = 4;
+  CopiedMetaChildMsg ChildAttr = 5;
+  int64 ChunkSize = 6;
+  int32 ExpireMs = 7;
+}
+
+/* messages to update meta */
+
+message MetaTxMsg {
+  CopiedMetaMsg NewMeta = 1;
+  LeaderNodeMsg Leader = 2;
+  int32 Status = 3;
+}
+
+message MetaTxWithPrevMsg {
+  LeaderNodeMsg Leader = 1;
+  CopiedMetaMsg NewMeta = 2;
+  CopiedMetaMsg Prev = 3;
+  int32 Status = 4;
+}
+
+message UpdateMetaAttrRpcMsg {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  uint32 Mode = 4;
+  int64 Ts = 5;
+}
+
+message BeginCreateMetaArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  CopiedMetaChildMsg ParentInodeAttr = 4;
+  string NewKey = 5;
+  int64 ChunkSize = 6;
+  uint32 Mode = 7;
+  int32 ExpireMs = 8;
+}
+
+message BeginCreateChildMetaArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  CopiedMetaChildMsg ChildAttr = 4;
+}
+
+message BeginUpdateMetaSizeArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  int64 NewSize = 4;
+  int64 MTime = 5;
+  uint32 Mode = 6;
+}
+
+message BeginTruncateMetaArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  int64 NewObjectSize = 4;
+}
+
+message BeginUpdateMetaKeyArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  string OldKey = 4;
+  string NewKey = 5;
+  CopiedMetaChildMsg Parent = 6;
+}
+
+message BeginDeleteMetaArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  string RemovedKey = 4;
+}
+
+message BeginLinkMetaArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  CopiedMetaChildMsg ChildAttr = 4;
+}
+
+message BeginUnlinkMetaArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  string ChildName = 4;
+}
+
+message RenameRetMsg {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  CopiedMetaMsg Parent = 3;
+  int32 MayErrorReply = 4;
+}
+
+message BeginRenameMetaArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 InodeKey = 3;
+  string SrcName = 4;
+  string DstName = 5;
+  CopiedMetaChildMsg ChildAttr = 6;
+}
+
+message CommitArgs {
+  TxIdMsg RpcSeqNum = 1;
+  TxIdMsg CommitTxId = 2;
+  uint64 NodeListVer = 3;
+}
+
+message CommitMigrationArgs {
+  TxIdMsg RpcSeqNum = 1;
+  TxIdMsg CommitTxId = 2;
+  MigrationIdMsg MigrationId = 3;
+  uint64 NodeListVer = 4;
+}
+
+message AbortCommitArgs {
+  TxIdMsg RpcSeqNum = 1;
+  uint64 NodeListVer = 2;
+  repeated TxIdMsg AbortTxIds = 3;
+}
+
+message UpdateChildAttrMsg {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  uint64 ParentInodeKey = 3;
+  CopiedMetaChildMsg ChildAttr = 4;
+}
+
+message BeginUpdateChildAttrMsg {
+  TxIdMsg TxId = 1;
+  uint64 ParentInodeKey = 2;
+  CopiedMetaChildMsg ChildAttr = 3;
+}
+
+/* messages to persist meta */
+
+message PersistArgs {
+  uint64 InodeKey = 1;
+  int32 Priority = 2;
+  CoordinatorIdMsg Id = 3;
+  uint64 NodeListVer = 4;
+}
+
+message DeletePersistArgs {
+  uint64 NodeListVer = 1;
+  CoordinatorIdMsg Id = 2;
+  string Key = 3;
+  uint64 InodeKey = 4;
+  int32 Priority = 5;
+}
+
+/* messages to persist chunks */
+
+message MpuAddArgs {
+  uint64 NodeListVer = 1;
+  TxIdMsg TxId = 2;
+  string MetaKey = 3;
+  CopiedMetaMsg Meta = 4;
+  repeated int64 Offsets = 5;
+  string UploadId = 6;
+  int32 Priority = 7;
+}
+
+message MpuAddRetIndex {
+  uint32 Index = 1;
+  string Etag = 2;
+  uint32 CVer = 3;
+}
+
+message MpuAddRet {
+  repeated MpuAddRetIndex Outs = 1;
+  int32 Status = 2;
+  LeaderNodeMsg Leader = 3;
+}
+
+message CommitPersistChunkArgs {
+  TxIdMsg TxId = 1;
+  TxIdMsg CommitTxId = 2;
+  uint64 InodeKey = 3;
+  repeated int64 Offsets = 4;
+  repeated uint32 CVers = 5;
+  int32 Priority = 6;
+  uint32 Index = 7;
+  uint64 NodeListVer = 8;
+  string NewFetchKey = 9;
+}
+
+/* messages for node scaling */
+
+message NodeMsg {
+  bytes Addr = 1;
+  int32 Port = 2;
+  uint32 NodeId = 3;
+  string GroupId = 4;
+}
+
+message UpdateNodeListArgs {
+  NodeMsg Node = 1;
+  uint64 NodeListVer = 2;
+  TxIdMsg TxId = 3;
+  bool IsAdd = 4;
+  MigrationIdMsg MigrationId = 5;
+}
+
+message InitNodeListArgs {
+  repeated NodeMsg Nodes = 1;
+  uint64 NewNodeListVer = 2;
+  uint64 NodeListVer = 3;
+  TxIdMsg TxId = 4;
+  MigrationIdMsg MigrationId = 5;
+}
+
+message UpdateNodeListRet {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  bool NeedRestore = 3;
+}
+
+message WorkingChunkMsg {
+  uint32 ChunkVer = 1;
+  int64 Offset = 2;
+  CommittedStagingChunkMsg Stags = 3;
+}
+
+message CommittedStagingChunkMsg {
+  int64 Slop = 1;
+  int64 Length = 2;
+  bool IsDeleting = 3;
+  bytes Data = 4;
+}
+
+message GetApiIpAndPortRet {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  string ApiAddr = 3;
+  int32 ApiPort = 4;
+}
+
+message NodeJoinArgs {
+  string RequesterNode = 1;
+  string GroupId = 2;
+  bool IsReadOnly = 3;
+  uint64 NodeListVer = 8;
+}
+
+message NodeJoinRet {
+  bool IsReadOnly = 1;
+  string GroupId = 2;
+  int32 Status = 3;
+  LeaderNodeMsg Leader = 4;
+}
+
+message RestoreDirtyChunksArgs {
+  MigrationIdMsg MigrationId = 1;
+  uint64 InodeKey = 2;
+  int64 ChunkSize = 3;
+  uint32 ChunkVer = 4;
+  int64 Offset = 5;
+  int64 ObjectSize = 6;
+}
+
+message RestoreDirtyMetasArgs {
+  MigrationIdMsg MigrationId = 1;
+  repeated CopiedMetaMsg Metas = 2;
+  repeated InodeToFileMsg Files = 3;
+  repeated CopiedMetaMsg DirMetas = 4;
+  repeated InodeToFileMsg DirFiles = 5;
+}
+
+message CoordinatorUpdateNodeListArgs {
+  NodeMsg Node = 1;
+  CoordinatorIdMsg Id = 2;
+  bool IsAdd = 3;
+  uint64 NodeListVer = 4;
+}
+
+message UpdateMembershipRet {
+  int32 Status = 1;
+  LeaderNodeMsg Leader = 2;
+  MembershipListMsg List = 3;
+}
+
+message MembershipListMsg {
+  repeated NodeMsg Servers = 1;
+  repeated TxIdMsg TxIds = 2;
+}
+
+message MigrationArgs {
+  NodeMsg Node = 1;
+  uint64 NodeListVer = 2;
+  TxIdMsg TxId = 3;
+  MigrationIdMsg MigrationId = 4;
+}
+
+
+/* messages for logging */
+message StagingChunkAddMsg {
+  int64 Slop = 1;
+  int64 Length = 2;
+  bytes UpdateType = 3;
+  int64 FileOffset = 4;
+  string FetchKey = 5;
+  int32 Filled = 6;
+}
+
+message WorkingChunkAddMsg {
+  int64 Offset = 1;
+  repeated StagingChunkAddMsg Stagings = 3;
+}
+
+message AppendCommitUpdateChunksMsg {
+  uint64 InodeKey = 1;
+  uint32 Version = 2;
+  int64 ChunkSize = 3;
+  int64 ObjectSize = 4;
+  bool IsDelete = 5;
+  repeated WorkingChunkAddMsg Chunks = 6;
+}
+
+message MetaCommitRecordMsg {
+  uint64 TxSeqNum = 1;
+  string GroupId = 2;
+}
+
+message TwoPCCommitRecordMsg {
+  TxIdMsg TxId = 1;
+  int32 TxType = 2;
+  CopiedMetaMsg PrimaryMeta = 3;
+  repeated CopiedMetaMsg PrimaryPrev = 4;
+  bool PrimaryLocal = 5;
+  repeated CopiedMetaMsg LocalMetas = 6;
+  repeated MetaCommitRecordMsg RemoteMetas = 7;
+  repeated UpdateChunkRecordMsg Chunks = 8;
+  uint64 NextTxSeqNum = 9;
+}
+
+message TwoPCCreateMetaCommitRecordMsg {
+  TxIdMsg TxId = 1;
+  string NewKey = 2;
+  CopiedMetaMsg Meta = 3;
+  MetaCommitRecordMsg RemoteMeta = 4;
+  CopiedMetaMsg Parent = 5;
+  MetaCommitRecordMsg RemoteParent = 6;
+  uint64 NextTxSeqNum = 7;
+}
+
+message TwoPCDeleteMetaCommitRecordMsg {
+  TxIdMsg TxId = 1;
+  string Key = 2;
+  CopiedMetaMsg Meta = 3;
+  CopiedMetaMsg Prev = 4;
+  MetaCommitRecordMsg RemoteMeta = 5;
+  CopiedMetaMsg Parent = 6;
+  MetaCommitRecordMsg RemoteParent = 7;
+  uint64 NextTxSeqNum = 8;
+}
+
+message CommitUpdateMetaKeyArgs {
+  string RemovedKey = 1;
+  string NewKey = 2;
+  CopiedMetaMsg Meta = 3;
+}
+
+message CommitUpdateParentMetaKeyArgs {
+  CopiedMetaMsg Meta = 1;
+  string Key = 2;
+}
+
+message TwoPCRenameCommitRecordMsg {
+  TxIdMsg TxId = 1;
+  repeated CommitUpdateMetaKeyArgs LocalUpdateMetaKeys = 2;
+  repeated CommitUpdateParentMetaKeyArgs LocalUpdateParents = 3;
+  repeated MetaCommitRecordMsg RemoteOps = 4;
+  uint64 NextTxSeqNum = 7;
+}
+
+message UpdateMetaMsg {
+  TxIdMsg TxId = 1;
+  CopiedMetaMsg Meta = 2;
+}
+
+message CreateMetaMsg {
+  TxIdMsg TxId = 1;
+  CopiedMetaMsg Meta = 2;
+  string NewKey = 3;
+}
+
+message UpdateParentMetaMsg {
+  TxIdMsg TxId = 1;
+  CopiedMetaMsg Meta = 2;
+  string NewKey = 3;
+}
+
+message DeleteMetaMsg {
+  TxIdMsg TxId = 1;
+  CopiedMetaMsg Meta = 2;
+  string Key = 3;
+}
+
+message UpdateMetaKeyMsg {
+  TxIdMsg TxId = 1;
+  CopiedMetaMsg Meta = 2;
+  string OldKey = 3;
+  string NewKey = 4;
+}
+
+message NodeGroupTxMsg {
+  uint64 TxSeqNum = 1;
+  NodeMsg Node = 2;
+}
+
+message TwoPCNodeListCommitRecordMsg {
+  TxIdMsg TxId = 1;
+  MigrationIdMsg MigrationId = 2;
+  NodeMsg Target = 3;
+  bool IsAdd = 4;
+  repeated NodeGroupTxMsg Locals = 5;
+  repeated NodeGroupTxMsg Remotes = 6;
+  uint64 NextTxSeqNum = 7;
+}
+
+message UpdateNodeListMsg {
+  TxIdMsg TxId = 1;
+  MigrationIdMsg MigrationId = 2;
+  bool IsAdd = 3;
+  bool NeedRestore = 4;
+  MembershipListMsg Nodes = 5;
+  uint64 NodeListVer = 6;
+}
+
+message MpuBeginMsg {
+  TxIdMsg TxId = 1;
+  repeated string Keys = 2;
+  repeated string UploadIds = 3;
+}
+
+message StringPair {
+  string Key = 1;
+  string Value = 2;
+}
+
+message PersistedChunkInfoMsg {
+  uint64 TxSeqNum = 1;
+  string GroupId = 2;
+  uint64 InodeKey = 3; // for ApplyAsPersistChunk
+  string NewFetchKey = 4;
+  repeated int64 Offsets = 5;
+  repeated uint32 CVers = 6;
+}
+
+message MetaPersistRecordMsg {
+  uint64 InodeKey = 1;
+  uint32 Version = 2;
+  int64 Ts = 3;
+  repeated PersistedChunkInfoMsg Chunks = 5;
+}
+
+message TwoPCPersistRecordMsg {
+  TxIdMsg TxId = 1;
+  MetaPersistRecordMsg PrimaryMeta = 2;
+  repeated string MetaKeys = 3;
+  uint64 NextTxSeqNum = 4;
+}
+
+message ChunkRemoveDirtyMsg {
+  uint64 InodeKey = 1;
+  int64 Offset = 2;
+  uint32 Version = 3;
+}
+
+message InodeToFileMsg {
+  uint64 InodeKey = 1;
+  string FilePath = 2;
+}
+
+message MigrationMsg {
+  TxIdMsg TxId = 1;
+  MigrationIdMsg MigrationId = 2;
+  repeated uint64 RemoveDirtyInodeIds = 3;
+  repeated ChunkRemoveDirtyMsg RemoveDirtyChunks = 4;
+  repeated CopiedMetaMsg AddMetas = 5;
+  repeated AppendCommitUpdateChunksMsg AddChunks = 6;
+  repeated InodeToFileMsg AddFiles = 7;
+  repeated uint64 RemoveDirInodeIds = 8;
+  repeated CopiedMetaMsg DirMetas = 9;
+  repeated InodeToFileMsg DirFiles = 10;
+}
+
+message AddInodeFileMapMsg {
+  CopiedMetaMsg Meta = 1;
+  string Key = 2;
+}
+
+message OpenChunksArgs {
+  uint64 NodeListVer = 1;
+  MetaRWHandlerMsg Handler = 2;
+  string Key = 3;
+}
+
+message CreateChunkArgs {
+  uint64 InodeKey = 1;
+  string Key = 2;
+  uint32 Version = 3;
+  int64 Offset = 4;
+  int64 FileOffset = 5;
+  int64 Length = 6;
+}
+
+message SetXAttrArgs {
+  uint64 NodeListVer = 1;
+  int64 ChunkSize = 2;
+  int32 ExpireMs = 3;
+}
+
+
+// message for log compaction
+
+message DropLRUChunksArgs {
+  repeated uint64 InodeKeys = 1;
+  repeated int64 Offsets = 2;
+}
+
+message DirtyChunkInfoMsg {
+  uint64 InodeKey = 1;
+  repeated int64 Offsets = 2;
+  repeated uint32 Versions = 3;
+  int64 ChunkSize = 4;
+  int64 ObjectSize = 5;
+}
+
+message DirtyMetaInfoMsg {
+  uint64 InodeKey = 1;
+  uint32 Version = 2;
+  int64 Timestamp = 3;
+  int32 ExpireMs = 4;
+}
+
+message DeletedFileInfoMsg {
+  string Key = 1;
+  uint64 InodeKey = 2;
+  int64 Timestamp = 3;
+  int32 ExpireMs = 4;
+}
+
+message DirtyMgrSnapshotMsg {
+  repeated DirtyChunkInfoMsg CTable = 1;
+  repeated DirtyMetaInfoMsg MTable = 2;
+  repeated DeletedFileInfoMsg DTable = 3;
+  repeated MigrationMsg Migrating = 4;
+}
+
+message RaftNodeListMsg {
+  repeated NodeMsg Nodes = 1;
+  uint64 Version = 2;
+}
+
+message RaftGroupMgrSnapshotMsg {
+  RaftNodeListMsg NodeList = 1;
+  repeated NodeMsg Leaders = 2;
+}
+
+message RemoveNonDirtyChunksMsg {
+  repeated uint64 InodeKeys = 1;
+}
+
+message ForgetAllDirtyLogArgs {
+
+}
