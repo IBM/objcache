@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/takeshi-yoshimura/fuse/fuseops"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/common"
 )
 
 type Meta struct {

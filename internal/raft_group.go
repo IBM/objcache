@@ -15,8 +15,8 @@ import (
 
 	"github.com/serialx/hashring"
 	"github.com/spaolacci/murmur3"
-	"github.ibm.com/TYOS/objcache/api"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/api"
+	"github.com/IBM/objcache/common"
 	"google.golang.org/protobuf/proto"
 )
 

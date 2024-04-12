@@ -28,8 +28,8 @@ import (
 	"github.com/takeshi-yoshimura/fuse"
 
 	"github.com/google/btree"
-	"github.ibm.com/TYOS/objcache/api"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/api"
+	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )

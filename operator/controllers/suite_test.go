@@ -19,7 +19,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	trlv1alpha1 "github.ibm.com/TYOS/objcache/operator/api/v1alpha1"
+	trlv1alpha1 "github.com/IBM/objcache/operator/api/v1alpha1"
 	//+kubebuilder:scaffold:imports
 )
 

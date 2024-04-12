@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/google/btree"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 )
 

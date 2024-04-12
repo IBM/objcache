@@ -13,7 +13,7 @@ import (
 	"github.com/takeshi-yoshimura/fuse"
 	"google.golang.org/protobuf/proto"
 
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/common"
 )
 
 type TxId struct {

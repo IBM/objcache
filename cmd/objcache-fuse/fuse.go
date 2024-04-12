@@ -9,8 +9,8 @@ import (
 	"flag"
 	"time"
 
-	"github.ibm.com/TYOS/objcache/common"
-	. "github.ibm.com/TYOS/objcache/internal"
+	"github.com/IBM/objcache/common"
+	. "github.com/IBM/objcache/internal"
 	"golang.org/x/sys/unix"
 
 	"context"

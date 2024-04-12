@@ -14,9 +14,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/IBM/objcache/api"
+	"github.com/IBM/objcache/common"
 	"github.com/takeshi-yoshimura/fuse"
-	"github.ibm.com/TYOS/objcache/api"
-	"github.ibm.com/TYOS/objcache/common"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

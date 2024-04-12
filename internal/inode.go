@@ -16,7 +16,7 @@ import (
 
 	"github.com/serialx/hashring"
 	"github.com/takeshi-yoshimura/fuse/fuseops"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )

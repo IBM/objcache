@@ -22,7 +22,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/common"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/client"

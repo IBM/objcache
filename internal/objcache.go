@@ -24,8 +24,8 @@ import (
 
 	"github.com/serialx/hashring"
 	"github.com/takeshi-yoshimura/fuse"
-	"github.ibm.com/TYOS/objcache/api"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/api"
+	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"

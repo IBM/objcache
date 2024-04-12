@@ -1,7 +1,7 @@
 /*
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
- *//*
+ */ /*
 Copyright 2023.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,8 +34,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	trlv1alpha1 "github.ibm.com/TYOS/objcache/operator/api/v1alpha1"
-	"github.ibm.com/TYOS/objcache/operator/controllers"
+	trlv1alpha1 "github.com/IBM/objcache/operator/api/v1alpha1"
+	"github.com/IBM/objcache/operator/controllers"
 	//+kubebuilder:scaffold:imports
 )
 

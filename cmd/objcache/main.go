@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.ibm.com/TYOS/objcache/common"
-	"github.ibm.com/TYOS/objcache/internal"
+	"github.com/IBM/objcache/common"
+	"github.com/IBM/objcache/internal"
 	_ "go.uber.org/automaxprocs"
 	"golang.org/x/sys/unix"
 )

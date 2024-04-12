@@ -12,8 +12,8 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/sirupsen/logrus"
-	"github.ibm.com/TYOS/objcache/api"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/api"
+	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 )
 

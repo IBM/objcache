@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/common"
 )
 
 type ParticipantOp interface {

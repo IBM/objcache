@@ -14,7 +14,7 @@ import (
 
 	"github.com/google/btree"
 	"github.com/takeshi-yoshimura/fuse"
-	"github.ibm.com/TYOS/objcache/common"
+	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 )
 
