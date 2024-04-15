@@ -70,11 +70,7 @@ c_objcache: objcache client
 	docker build --pull -t $(NOFS_IMAGE_TAG) -f ./cmd/objcache/Dockerfile .
 c_operator: 
 	docker build --pull -t $(OPERATOR_IMAGE_TAG) -f operator/Dockerfile operator/
-crd: operator operator/bin/kustomize
-	./operator/bin/kustomize build operator/config/crd > deploy/kubernetes/crd.yaml
-operator-yaml: operator
-	cd ./operator/config/manager && ../../bin/kustomize edit set image controller=${OPERATOR_IMAGE_TAG}
-	./operator/bin/kustomize build operator/config/default > deploy/kubernetes/operator.yaml
+crd: operator operator/bin/kustomize deploy/kubernetes/crd.yaml
 operator-yaml: deploy/kubernetes/crd.yaml deploy/kubernetes/operator.yaml deploy/kubernetes/namespace.yaml
 container: c_csi-controller c_csi-node c_objcache c_operator crd operator-yaml
 

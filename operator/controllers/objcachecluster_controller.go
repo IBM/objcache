@@ -554,7 +554,7 @@ func (r *ObjcacheClusterReconciler) UpdateStatefulSet(ctx context.Context, objca
 		}
 		container := corev1apply.Container().WithName("objcache").
 			WithImage(objcache.Spec.ObjcacheImage).WithImagePullPolicy(corev1.PullAlways).
-			WithSecurityContext(corev1apply.SecurityContext().WithPrivileged(true).WithCapabilities(corev1apply.Capabilities().WithAdd("SYS_ADMIN")).WithAllowPrivilegeEscalation(true)).
+			//WithSecurityContext(corev1apply.SecurityContext().WithPrivileged(true).WithCapabilities(corev1apply.Capabilities().WithAdd("SYS_ADMIN")).WithAllowPrivilegeEscalation(true)).
 			WithCommand("/objcache", "--listenIp=0.0.0.0", "--externalIp=$(POD_IP)", "--serverId=k8s", "--passiveRaftInit=k8s",
 				fmt.Sprintf("--raftGroupId=%v", r.GetGroupId(objcache.Status.Seed, groupIndex)),
 				fmt.Sprintf("--raftPort=%v", objcache.Spec.Port),
@@ -573,7 +573,6 @@ func (r *ObjcacheClusterReconciler) UpdateStatefulSet(ctx context.Context, objca
 			WithEnv(corev1apply.EnvVar().WithName("NODE_ID").WithValueFrom(corev1apply.EnvVarSource().WithFieldRef(corev1apply.ObjectFieldSelector().WithAPIVersion("v1").WithFieldPath("spec.nodeName")))).
 			WithEnv(corev1apply.EnvVar().WithName("POD_IP").WithValueFrom(corev1apply.EnvVarSource().WithFieldRef(corev1apply.ObjectFieldSelector().WithAPIVersion("v1").WithFieldPath("status.podIP")))).
 			WithEnv(corev1apply.EnvVar().WithName("GOTRACEBACK").WithValue("crash")).
-			WithVolumeMounts().
 			WithVolumeMounts(corev1apply.VolumeMount().WithName("data-dir").WithMountPath(objcache.Spec.LocalVolume.MountPath)).
 			WithVolumeMounts(corev1apply.VolumeMount().WithName("secret-file").WithMountPath(fmt.Sprintf("%v/secret.yaml", objcache.Spec.LocalVolume.MountPath)).WithReadOnly(true).WithSubPath("secret.yaml")).
 			WithVolumeMounts(corev1apply.VolumeMount().WithName("config-file").WithMountPath(fmt.Sprintf("%v/config.yaml", objcache.Spec.LocalVolume.MountPath)).WithReadOnly(true).WithSubPath("config.yaml"))
@@ -596,8 +595,8 @@ func (r *ObjcacheClusterReconciler) UpdateStatefulSet(ctx context.Context, objca
 		}
 		pod.Spec.WithContainers(container)
 		objcacheIndex = len(pod.Spec.Containers) - 1
-		pvc := &corev1apply.PersistentVolumeClaimApplyConfiguration{}
 		if objcache.Spec.LocalVolume.StorageClass != "" {
+			pvc := &corev1apply.PersistentVolumeClaimApplyConfiguration{}
 			pvc.WithName("data-dir").WithSpec(corev1apply.PersistentVolumeClaimSpec().
 				WithStorageClassName(objcache.Spec.LocalVolume.StorageClass).WithAccessModes(corev1.ReadWriteOnce).
 				WithVolumeMode(corev1.PersistentVolumeFilesystem).
@@ -605,8 +604,10 @@ func (r *ObjcacheClusterReconciler) UpdateStatefulSet(ctx context.Context, objca
 				WithStatus(corev1apply.PersistentVolumeClaimStatus().WithPhase(corev1.ClaimPending)) // prevent from unnecessary patch
 			//ret := &appsv1apply.StatefulSetPersistentVolumeClaimRetentionPolicyApplyConfiguration{}
 			//ret.WithWhenDeleted(appsv1.DeletePersistentVolumeClaimRetentionPolicyType).WithWhenScaled(appsv1.DeletePersistentVolumeClaimRetentionPolicyType)
+			sf.Spec.WithVolumeClaimTemplates(pvc) //.WithPersistentVolumeClaimRetentionPolicy(ret) // NOTE: this is enabled at alpha versions
+		} else {
+			pod.Spec.WithVolumes(corev1apply.Volume().WithName("data-dir").WithEmptyDir(corev1apply.EmptyDirVolumeSource()))
 		}
-		sf.Spec.WithVolumeClaimTemplates(pvc) //.WithPersistentVolumeClaimRetentionPolicy(ret) // NOTE: this is enabled at alpha versions
 	}
 	hasLogDir := false
 	for _, v := range pod.Spec.Volumes {

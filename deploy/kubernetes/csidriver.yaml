@@ -5,3 +5,8 @@ metadata:
   namespace: objcache-operator-system
 spec:
   serviceAccount: objcache-csi-sa
+  fuseConfig: {}
+  overridePodTemplateSpec:
+    spec:
+      imagePullSecrets:
+      - name: taas

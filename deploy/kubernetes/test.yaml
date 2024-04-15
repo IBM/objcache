@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: objcache-sample-test-0
+spec:
+  containers:
+   - image: ubuntu:latest
+     name: test
+     imagePullPolicy: Always
+     command:
+     - bash
+     - -c
+     - |
+       trap "exit 0" SIGTERM SIGINT
+       sleep infinity &
+       wait $!
+     volumeMounts:
+       - mountPath: /objcache
+         name: objcache
+  volumes:
+   - name: objcache
+     persistentVolumeClaim:
+       claimName: objcache-sample-pvc
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: objcache-sample-test-1
+spec:
+  containers:
+   - image: ubuntu:latest
+     name: test
+     imagePullPolicy: Always
+     command:
+     - bash
+     - -c
+     - |
+       trap "exit 0" SIGTERM SIGINT
+       sleep infinity &
+       wait $!
+     volumeMounts:
+       - mountPath: /objcache
+         name: objcache
+  volumes:
+   - name: objcache
+     persistentVolumeClaim:
+       claimName: objcache-sample-pvc

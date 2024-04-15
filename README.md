@@ -7,6 +7,7 @@ Objcache maps objects stored at COS buckets (e.g., s3://bucket/key) to files (e.
 
 ```bash
 $ kubectl apply -f deploy/kubernetes/crd.yaml \
+                -f deploy/kubernetes/namespace.yaml \
                 -f deploy/kubernetes/operator.yaml --server-side=true
 ```
 
@@ -30,6 +31,26 @@ $ kubectl apply -f secret.yaml
 ```bash
 $ kubectl apply -f deploy/kubernetes/csidriver.yaml \
                 -f deploy/kubernetes/objcache-sample.yaml
+```
+
+5. Test a pod with the PVC mounted
+
+```bash
+$ kubectl apply -f deploy/kubernetes/test.yaml
+$ kubectl exec -it objcache-sample-test-0 -- bash
+
+$ ls /objcache/test-bucket/
+$ echo "test" > /objcache/test-bucket/test.txt
+$ exit
+
+$ kubectl exec -it objcache-sample-test-1 -- bash
+
+$ cat /objcache/test-bucket/test.txt
+$ sync /objcache/test-bucket/test.txt
+$ exit
+
+$ aws s3 s3://test-bucket/test.txt /tmp/test.txt
+$ cat /tmp/test.txt
 ```
 
 ### How to build

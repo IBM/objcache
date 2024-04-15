@@ -17,9 +17,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/IBM/objcache/common"
 	"github.com/serialx/hashring"
 	"github.com/takeshi-yoshimura/fuse/fuseops"
-	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 )
 
@@ -788,9 +788,9 @@ func (n *InodeMgr) CommitSetMetaAndInodeFile(working *WorkingMeta, children map[
 		n.nextInodeId = low + 1
 	}
 	if len(children) > 0 {
-		if inode.children != nil {
-			log.Warnf("BUG: CommitSetMetaAndInodeFile, overwrite childMap, inodeKey=%v, key=%v", working.inodeKey, key)
-		}
+		//if inode.children != nil {
+		//	log.Warnf("BUG: CommitSetMetaAndInodeFile, overwrite childMap, inodeKey=%v, key=%v", working.inodeKey, key)
+		//}
 		inode.children = make(map[string]InodeKeyType)
 		for name, child := range children {
 			high = uint32(child >> 32)

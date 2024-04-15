@@ -4,10 +4,14 @@ metadata:
   name: objcache-sample
 spec:
   generatedStorageClassName: objcache-sample
-  shards: 1
+  shards: 3
   raftFollowers: 0
   seed: 202305101353
   secret: objcache-secret
+  overridePodSpec:
+    imagePullSecrets:
+    - name: taas
+  serverConfig: {}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
