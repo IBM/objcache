@@ -49,7 +49,7 @@ $ cat /objcache/test-bucket/test.txt
 $ sync /objcache/test-bucket/test.txt
 $ exit
 
-$ aws s3 s3://test-bucket/test.txt /tmp/test.txt
+$ aws s3 cp s3://test-bucket/test.txt /tmp/test.txt
 $ cat /tmp/test.txt
 ```
 
