@@ -2,403 +2,74 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
-	"container/list"
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"io/fs"
 	"math"
 	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
-	"reflect"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/takeshi-yoshimura/fuse"
 
-	"github.com/google/btree"
 	"github.com/IBM/objcache/api"
 	"github.com/IBM/objcache/common"
 	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 )
 
-const (
-	AppendEntryCommandLogBaseSize = int32(crc32.Size + 7)
-	AppendEntryCommandLogSize     = AppendEntryCommandLogBaseSize + int32(AppendEntryFileCmdLength)
-
-	AppendEntryFileCmdLength         = uint8(28)
-	AppendEntryNoOpCmdLength         = uint8(0)
-	AppendEntryAddServerCmdLength    = uint8(10)
-	AppendEntryRemoveServerCmdLength = uint8(4)
-	AppendEntryCommitTxCmdLength     = uint8(16)
-	AppendEntryResetExtLogCmdLength  = uint8(12)
-)
-
-type FileIdType struct {
-	lower uint64
-	upper uint64
-}
-
-func (f FileIdType) Put(buf []byte) {
-	binary.LittleEndian.PutUint64(buf[0:SizeOfUint64], f.lower)
-	binary.LittleEndian.PutUint64(buf[SizeOfUint64:SizeOfUint64*2], f.upper)
-}
-
-func (f FileIdType) IsValid() bool {
-	return f.upper > 0 || f.lower > 0
-}
-
-func NewFileIdTypeFromInodeKey(inodeKey InodeKeyType, offset int64, chunkSize int64) FileIdType {
-	return FileIdType{lower: uint64(inodeKey), upper: uint64(offset - offset%chunkSize)}
-}
-
-func NewFileIdTypeFromBuf(buf []byte) FileIdType {
-	lower := binary.LittleEndian.Uint64(buf[0:SizeOfUint64])
-	upper := binary.LittleEndian.Uint64(buf[SizeOfUint64 : SizeOfUint64*2])
-	return FileIdType{lower: lower, upper: upper}
-}
-
-type AppendEntryCommand struct {
-	buf [AppendEntryCommandLogSize]byte
-	/**
-	 AppendEntryCommand format:
-	-----------------------------------------------------------------------
-	| Bits | 0 - 3 | 4 - 4       | 5 - 8   | 9 - 10    | 10 - entryLength |
-	| Name | CRC32 | entryLength | term    | extCmdId  | extEntryPayload  |
-	-----------------------------------------------------------------------
-	*/
-}
-
-func (l *AppendEntryCommand) setControlBits(extPayloadLength uint8, term uint32, extCmdId uint16) {
-	l.buf[crc32.Size] = uint8(AppendEntryCommandLogBaseSize) + extPayloadLength
-	binary.LittleEndian.PutUint32(l.buf[crc32.Size+1:crc32.Size+5], term)
-	binary.LittleEndian.PutUint16(l.buf[crc32.Size+5:AppendEntryCommandLogBaseSize], extCmdId)
-}
-func (l *AppendEntryCommand) GetExtPayload() []byte {
-	return l.buf[AppendEntryCommandLogBaseSize:]
-}
-
-func (l *AppendEntryCommand) setChecksum(extBuf []byte) {
-	chkSum := crc32.NewIEEE()
-	entryLength := l.GetEntryLength()
-	_, _ = chkSum.Write(l.buf[crc32.Size:entryLength])
-	if extBuf != nil {
-		_, _ = chkSum.Write(extBuf)
-	}
-	copy(l.buf[:crc32.Size], chkSum.Sum(nil))
-}
-func (l *AppendEntryCommand) setChecksumFromFile(fileName string, offset int64, dataLen uint32) error {
-	chkSum := crc32.NewIEEE()
-	entryLength := l.GetEntryLength()
-	_, _ = chkSum.Write(l.buf[crc32.Size:entryLength])
-	fd, errno := unix.Open(fileName, unix.O_RDONLY, 0644)
-	if errno != nil {
-		log.Errorf("Failed: RaftFiles.CalcCheckSum, openCacheNoLock, fileName=%v, errno=%v", fileName, errno)
-		return errno
-	}
-	buf := make([]byte, 4096)
-	var count = uint32(0)
-	for count < dataLen {
-		last := uint32(4096)
-		if count+4096 > dataLen {
-			last = dataLen - count
-		}
-		c, err := unix.Pread(fd, buf[:last], offset+int64(count))
-		if err != nil {
-			log.Errorf("Failed: CalcCheckSum, Pread, fd=%v, offset=%v, count=%v, err=%v", fd, offset, count, err)
-			_ = unix.Close(fd)
-			return err
-		}
-		if c == 0 {
-			break
-		}
-		count += uint32(c)
-		chkSum.Write(buf[:c])
-	}
-	_ = unix.Fadvise(fd, 0, 0, unix.FADV_DONTNEED)
-	_ = unix.Close(fd)
-	copy(l.buf[:crc32.Size], chkSum.Sum(nil))
-	return nil
-}
-func (l *AppendEntryCommand) GetChecksum() []byte {
-	return l.buf[0:crc32.Size]
-}
-func (l *AppendEntryCommand) GetEntryLength() uint8 {
-	return l.buf[crc32.Size]
-}
-func (l *AppendEntryCommand) GetTerm() uint32 {
-	return binary.LittleEndian.Uint32(l.buf[crc32.Size+1 : crc32.Size+5])
-}
-func (l *AppendEntryCommand) GetExtCmdId() uint16 {
-	return binary.LittleEndian.Uint16(l.buf[crc32.Size+5 : crc32.Size+7])
-}
-
-func NewAppendEntryNoOpCommandDiskFormat(term uint32) (cmd AppendEntryCommand) {
-	cmd.setControlBits(AppendEntryNoOpCmdLength, term, AppendEntryNoOpCmdId)
-	cmd.setChecksum(nil)
-	return
-}
-func NewAppendEntryFileCommand(term uint32, extCmdId uint16, fileId FileIdType, fileOffset int64, fileContent []byte) (cmd AppendEntryCommand) {
-	cmd.setControlBits(AppendEntryFileCmdLength, term, extCmdId|DataCmdIdBit)
-	extEntryPayload := cmd.GetExtPayload()
-	fileId.Put(extEntryPayload[0:16])
-	binary.LittleEndian.PutUint32(extEntryPayload[16:20], uint32(len(fileContent)))
-	binary.LittleEndian.PutUint64(extEntryPayload[20:AppendEntryFileCmdLength], uint64(fileOffset))
-	cmd.setChecksum(fileContent)
-	return
-}
-func NewAppendEntryFileCommandFromFile(term uint32, extCmdId uint16, fileId FileIdType, fileOffset int64, dataLen uint32, fileName string) (cmd AppendEntryCommand, err error) {
-	cmd.setControlBits(AppendEntryFileCmdLength, term, extCmdId|DataCmdIdBit)
-	extEntryPayload := cmd.GetExtPayload()
-	fileId.Put(extEntryPayload[0:16])
-	binary.LittleEndian.PutUint32(extEntryPayload[16:20], uint32(dataLen))
-	binary.LittleEndian.PutUint64(extEntryPayload[20:AppendEntryFileCmdLength], uint64(fileOffset))
-	err = cmd.setChecksumFromFile(fileName, fileOffset, dataLen)
-	return
-}
-func (l *AppendEntryCommand) GetAsAppendEntryFile() (fileId FileIdType, fileLength int32, fileOffset int64) {
-	extEntryPayload := l.GetExtPayload()
-	fileId = NewFileIdTypeFromBuf(extEntryPayload[0:16])
-	fileLength = int32(binary.LittleEndian.Uint32(extEntryPayload[16:20]))
-	fileOffset = int64(binary.LittleEndian.Uint64(extEntryPayload[20:AppendEntryFileCmdLength]))
-	return
-}
-func NewAppendEntryAddServerCommand(term uint32, serverId uint32, ip [4]byte, port uint16) (cmd AppendEntryCommand) {
-	cmd.setControlBits(AppendEntryAddServerCmdLength, term, AppendEntryAddServerCmdId)
-	extEntryPayload := cmd.GetExtPayload()
-	binary.LittleEndian.PutUint32(extEntryPayload[0:4], serverId)
-	for i := int32(0); i < int32(4); i++ {
-		extEntryPayload[4+i] = ip[i]
-	}
-	binary.LittleEndian.PutUint16(extEntryPayload[8:AppendEntryAddServerCmdLength], port)
-	cmd.setChecksum(nil)
-	return
-}
-func (l *AppendEntryCommand) GetAsAddServer() (serverId uint32, ip [4]byte, port uint16) {
-	extEntryPayload := l.GetExtPayload()
-	serverId = binary.LittleEndian.Uint32(extEntryPayload[0:4])
-	for i := int32(0); i < int32(4); i++ {
-		ip[i] = extEntryPayload[4+i]
-	}
-	port = binary.LittleEndian.Uint16(extEntryPayload[8:AppendEntryAddServerCmdLength])
-	return
-}
-func NewAppendEntryRemoveServerCommand(term uint32, serverId uint32) (cmd AppendEntryCommand) {
-	cmd.setControlBits(AppendEntryRemoveServerCmdLength, term, AppendEntryRemoveServerCmdId)
-	extEntryPayload := cmd.GetExtPayload()
-	binary.LittleEndian.PutUint32(extEntryPayload[0:AppendEntryRemoveServerCmdLength], serverId)
-	cmd.setChecksum(nil)
-	return
-}
-func (l *AppendEntryCommand) GetAsRemoveServer() (serverId uint32) {
-	extEntryPayload := l.GetExtPayload()
-	serverId = binary.LittleEndian.Uint32(extEntryPayload[0:AppendEntryRemoveServerCmdLength])
-	return
-}
-func NewAppendEntryResetExtLogCommand(term uint32, fileId uint64, nextSeqNum uint32) (cmd AppendEntryCommand) {
-	cmd.setControlBits(AppendEntryResetExtLogCmdLength, term, AppendEntryResetExtLogCmdId)
-	extEntryPayload := cmd.GetExtPayload()
-	binary.LittleEndian.PutUint64(extEntryPayload[0:8], fileId)
-	binary.LittleEndian.PutUint32(extEntryPayload[8:AppendEntryResetExtLogCmdLength], nextSeqNum)
-	cmd.setChecksum(nil)
-	return
-}
-func NewAppendEntryDeleteExtLogCommand(term uint32, fileId uint64) (cmd AppendEntryCommand) {
-	cmd.setControlBits(AppendEntryResetExtLogCmdLength, term, AppendEntryResetExtLogCmdId)
-	extEntryPayload := cmd.GetExtPayload()
-	binary.LittleEndian.PutUint64(extEntryPayload[0:8], fileId)
-	cmd.setChecksum(nil)
-	return
-}
-func (l *AppendEntryCommand) GetAsResetExtLog() (fileId uint64, nextSeqNum uint32) {
-	extEntryPayload := l.GetExtPayload()
-	fileId = binary.LittleEndian.Uint64(extEntryPayload[0:8])
-	nextSeqNum = binary.LittleEndian.Uint32(extEntryPayload[8:AppendEntryResetExtLogCmdLength])
-	return
-}
-func NewAppendEntryCommitTxCommand(term uint32, txId *common.TxIdMsg) (cmd AppendEntryCommand) {
-	cmd.setControlBits(AppendEntryCommitTxCmdLength, term, AppendEntryCommitTxCmdId)
-	extEntryPayload := cmd.GetExtPayload()
-	binary.LittleEndian.PutUint32(extEntryPayload[0:4], txId.ClientId)
-	binary.LittleEndian.PutUint32(extEntryPayload[4:8], txId.SeqNum)
-	binary.LittleEndian.PutUint64(extEntryPayload[8:AppendEntryCommitTxCmdLength], txId.TxSeqNum)
-	return
-}
-func (l *AppendEntryCommand) GetAsCommitTx() (clientId uint32, seqNum uint32, txSeqNum uint64) {
-	extEntryPayload := l.GetExtPayload()
-	clientId = binary.LittleEndian.Uint32(extEntryPayload[0:4])
-	seqNum = binary.LittleEndian.Uint32(extEntryPayload[4:8])
-	txSeqNum = binary.LittleEndian.Uint64(extEntryPayload[8:AppendEntryCommitTxCmdLength])
-	return
-}
-
-func (l *AppendEntryCommand) AppendToRpcMsg(d *RpcMsg) (newOptHeaderLength uint16, newTotalFileLength uint32) {
-	var fileLength = int32(0)
-	var entryLength = l.GetEntryLength()
-	if l.GetExtCmdId()&DataCmdIdBit != 0 {
-		_, fileLength, _ = l.GetAsAppendEntryFile()
-	}
-	off := d.GetOptHeaderLength()
-	if off == 0 {
-		off = uint16(RpcOptControlHeaderLength)
-	}
-	d.SetOptHeaderLength(off + uint16(entryLength))
-	curFileLength, curNrEntries := d.GetOptControlHeader()
-	if fileLength > 0 {
-		d.SetTotalFileLength(curFileLength + uint32(fileLength))
-	}
-	d.SetNrEntries(curNrEntries + 1)
-	copy(d.optBuf[off:off+uint16(entryLength)], l.buf[:entryLength])
-	log.Debugf("AppendToRpcMsg: MyCopy(d.optBuf[%v+crc32.Size:%v] from buf=%v", off, off+uint16(entryLength), l.buf[:entryLength])
-	return off + uint16(entryLength), curFileLength + uint32(fileLength)
-}
-
-type HeadIndexFilePair struct {
-	headIndex uint64
-	filePath  string
-}
-
-func (h HeadIndexFilePair) Less(item btree.Item) bool {
-	r := item.(HeadIndexFilePair)
-	return h.headIndex < r.headIndex
-}
-
-type CachedCommand struct {
-	cmd   AppendEntryCommand
-	index uint64
-}
-
-func (c CachedCommand) Less(i btree.Item) bool {
-	return c.index < i.(CachedCommand).index
-}
-
-type CommandCache struct {
-	recent    *btree.BTree
-	lock      *sync.RWMutex
-	maxLength int
-}
-
-func NewCommandCache(maxLength int) CommandCache {
-	return CommandCache{recent: btree.New(3), lock: new(sync.RWMutex), maxLength: maxLength}
-}
-
-func (c CommandCache) Get(index uint64) (cmd AppendEntryCommand, ok bool) {
-	c.lock.RLock()
-	cached := c.recent.Get(CachedCommand{index: index})
-	c.lock.RUnlock()
-	if cached == nil {
-		return
-	}
-	return cached.(CachedCommand).cmd, true
-}
-
-func (c CommandCache) Put(index uint64, cmd AppendEntryCommand) {
-	c.lock.Lock()
-	if c.recent.Len() >= c.maxLength {
-		c.recent.DeleteMin()
-	}
-	c.recent.ReplaceOrInsert(CachedCommand{index: index, cmd: cmd})
-	c.lock.Unlock()
-}
-
-func (c *CommandCache) Clean() {
-	c.lock.Lock()
-	c.recent = btree.New(3)
-	c.lock.Unlock()
-}
-
-func (c CommandCache) CheckReset() (ok bool) {
-	if ok = c.lock.TryLock(); !ok {
-		log.Errorf("Failed: CommandCache.CheckReset, c.lock is taken")
-		return
-	}
-	if ok2 := c.recent.Len() == 0; !ok2 {
-		log.Errorf("Failed: CommandCache.CheckReset, c.recent.Len() != 0")
-		ok = false
-	}
-	c.lock.Unlock()
-	return
-}
-
-type LogFile struct {
-	rootDir    string
+type RaftLogger struct {
 	filePrefix string
-	hIdxPath   *btree.BTree
-	fd         int
+	disk       *OnDiskLog
 	lock       *sync.RWMutex
 	headIndex  uint64
-	logLength  uint64
-
-	cache CommandCache
+	maxNrCache int
 }
 
-func NewLogFile(rootDir string, filePrefix string) (ret *LogFile, reply int32) {
+func NewRaftLogger(rootDir string, filePrefix string, maxNrCache int) (ret *RaftLogger, reply int32) {
 	stat := unix.Stat_t{}
 	errno := unix.Stat(rootDir, &stat)
 	if errno == unix.ENOENT {
 		if errno = os.MkdirAll(rootDir, 0755); errno != nil {
-			log.Errorf("Failed: NewLogFile, MkdirAll, dir=%v, errno=%v", rootDir, errno)
+			log.Errorf("Failed: NewRaftLogger, MkdirAll, dir=%v, errno=%v", rootDir, errno)
 			return nil, ErrnoToReply(errno)
 		}
 	} else if errno != nil {
-		log.Errorf("Failed: NewLogFile, Stat, dir=%v, err=%v", rootDir, errno)
+		log.Errorf("Failed: NewRaftLogger, Stat, dir=%v, err=%v", rootDir, errno)
 		return nil, ErrnoToReply(errno)
 	}
 
-	ret = &LogFile{
-		rootDir: rootDir, filePrefix: filePrefix, headIndex: 0, logLength: 1, lock: new(sync.RWMutex),
-		hIdxPath: btree.New(3), cache: NewCommandCache(32),
+	ret = &RaftLogger{
+		filePrefix: filepath.Join(rootDir, filePrefix), headIndex: 0, lock: new(sync.RWMutex), maxNrCache: maxNrCache,
 	}
 	err := filepath.WalkDir(rootDir, func(filePath string, info fs.DirEntry, err error) error {
 		if err != nil || info.IsDir() || !strings.HasPrefix(info.Name(), filePrefix) {
 			return nil
 		}
-		var s os.FileInfo
-		s, errno = info.Info()
-		if errno != nil {
-			log.Errorf("Failed: NewLogFile, Info, filePath=%v, err=%v", filePath, errno)
-			return errno
-		}
-		var fd int
-		fd, errno = unix.Open(filePath, unix.O_RDONLY, 0644)
-		if errno != nil {
-			log.Errorf("Failed: NewLogFile, Open, filePath=%v, errno=%v", filePath, errno)
-			return errno
-		}
 		buf := [8]byte{}
-		var bufOff = 0
-		for bufOff < 8 {
-			var c int
-			c, errno = unix.Pread(fd, buf[bufOff:], int64(bufOff))
-			if errno != nil {
-				log.Errorf("Failed: NewLogFile, Pread, filePath=%v, errno=%v", filePath, errno)
-				return errno
-			}
-			if c == 0 {
-				break
-			}
-			bufOff += c
+		_, errno := NewOnDiskLog(filePath, 0, 1).ReadNoCache(buf[:], 0, 8, false)
+		if errno != nil {
+			log.Errorf("Failed (ignore): NewRaftLogger, ReadNoCache, filePath=%v, errno=%v", filePath, errno)
+			return errno
 		}
-		index := binary.LittleEndian.Uint64(buf[:])
-		if ret.headIndex < index {
-			ret.headIndex = index
-			ret.logLength = uint64(s.Size() / int64(AppendEntryCommandLogSize))
+		headIndex := binary.LittleEndian.Uint64(buf[:])
+		filePath2 := ret.__getFilePath(headIndex)
+		if filePath2 != filePath {
+			log.Errorf("Failed: NewRaftLogger, invalid file path: filePath=%v (correct: %v), headIndex=%v", filePath, filePath2, headIndex)
+			return unix.EINVAL
 		}
-		ret.hIdxPath.ReplaceOrInsert(HeadIndexFilePair{headIndex: index, filePath: filePath})
-		if errno = unix.Close(fd); errno != nil {
-			log.Warnf("Failed (ignore): NewLogFile, Close, fd=%v, erno=%v", fd, errno)
+		if ret.headIndex < headIndex {
+			ret.headIndex = headIndex
 		}
 		return nil
 	})
@@ -406,948 +77,200 @@ func NewLogFile(rootDir string, filePrefix string) (ret *LogFile, reply int32) {
 		return nil, ErrnoToReply(err)
 	}
 	if ret.headIndex == 0 {
-		reply = ret.CreateNewFile(1)
+		reply = ret.__createNewFile(1)
 	} else {
-		filePath := filepath.Join(rootDir, fmt.Sprintf("%s%d.log", filePrefix, ret.headIndex))
-		ret.fd, errno = unix.Open(filePath, unix.O_RDWR, 0644)
-		if errno != nil {
-			log.Errorf("Failed: NewLogFile, Open, filePath=%v, errno=%v", filePath, errno)
-			return nil, ErrnoToReply(errno)
-		}
+		filePath := ret.__getFilePath(ret.headIndex)
+		ret.disk = NewOnDiskLog(filePath, maxNrCache, 1)
 		reply = RaftReplyOk
 	}
 	return
 }
 
-func (f *LogFile) CreateNewFile(newHeadIndex uint64) (reply int32) {
-	f.lock.Lock()
+func (f *RaftLogger) __createNewFile(newHeadIndex uint64) (reply int32) {
 	f.headIndex = newHeadIndex
-	if f.fd > 0 {
-		if errno := unix.Close(f.fd); errno != nil {
-			log.Warnf("Failed (ignore): CreateNewFile, Close, fd=%v, errno=%v", f.fd, errno)
-		}
-	}
-	filePath := filepath.Join(f.rootDir, fmt.Sprintf("%s%d.log", f.filePrefix, newHeadIndex))
-	var errno error
-	f.fd, errno = unix.Open(filePath, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_SYNC, 0644)
-	if errno != nil {
-		f.lock.Unlock()
-		log.Errorf("Failed: CreateNewFile, Open, filePath=%v, errno=%v", filePath, errno)
-		return ErrnoToReply(errno)
-	}
+	filePath := f.__getFilePath(newHeadIndex)
+	f.disk = NewOnDiskLog(filePath, f.maxNrCache, 1)
 	buf := [8]byte{}
 	binary.LittleEndian.PutUint64(buf[:], newHeadIndex)
-	var bufOff = 0
-	for bufOff < 8 {
-		var c int
-		c, errno = unix.Pwrite(f.fd, buf[bufOff:], int64(bufOff))
-		if errno != nil {
-			f.lock.Unlock()
-			log.Errorf("Failed: CreateNewFile, Pwrite, errno=%v", errno)
-			return ErrnoToReply(errno)
-		}
-		bufOff += c
+	_, _, errno := f.disk.AppendSingleBuffer(buf[:])
+	if errno != nil {
+		log.Errorf("Failed: __createNewFile, AppendSingleBuffer, errno=%v", errno)
+		return ErrnoToReply(errno)
 	}
-	if err := unix.Fsync(f.fd); err != nil {
-		log.Errorf("Failed (ignore): CreateNewFile, Fsync, fd=%v, errno=%v", f.fd, err)
-	}
-	f.hIdxPath.ReplaceOrInsert(HeadIndexFilePair{headIndex: f.headIndex, filePath: filePath})
-	f.cache.Clean()
-	f.lock.Unlock()
 	return RaftReplyOk
 }
 
-func (f *LogFile) LoadCommandAt(logIndex uint64) (cmd AppendEntryCommand, reply int32) {
-	f.lock.RLock()
-	fd := f.fd
-	headIndex := f.headIndex
+func (f *RaftLogger) __getFilePath(headIndex uint64) string {
+	return fmt.Sprintf("%s%d.log", f.filePrefix, headIndex)
+}
+
+func (f *RaftLogger) __logOffsetToLogIndex(logOffset int64) (logIndex uint64) {
+	if logOffset < 8 {
+		return 0
+	}
+	return f.headIndex + uint64((logOffset-8)/int64(AppendEntryCommandLogSize))
+}
+
+func (f *RaftLogger) __logIndexToLogOffset(logIndex uint64) (logOffset int64) {
+	if logIndex == 0 || logIndex < f.headIndex {
+		return 0
+	}
+	return 8 + int64(logIndex-f.headIndex)*int64(AppendEntryCommandLogSize)
+}
+
+func (f *RaftLogger) LoadCommandAt(logIndex uint64) (cmd AppendEntryCommand, reply int32) {
 	if logIndex == 0 {
+		return GetAppendEntryCommand(math.MaxUint32, NewNoOpCommand()), RaftReplyOk
+	}
+	f.lock.RLock()
+	logOffset := f.__logIndexToLogOffset(logIndex)
+	if logOffset == 0 {
 		f.lock.RUnlock()
-		return NewAppendEntryNoOpCommandDiskFormat(math.MaxUint32), RaftReplyOk
+		log.Errorf("Failed: LoadCommandAt, no log exists, filePath=%v, logIndex=%v, headIndex=%v", f.disk.filePath, logIndex, f.headIndex)
+		return cmd, ErrnoToReply(unix.EOVERFLOW)
 	}
-	if logIndex < headIndex {
-		var filePath = ""
-		f.hIdxPath.AscendGreaterOrEqual(HeadIndexFilePair{headIndex: logIndex}, func(i btree.Item) bool {
-			filePath = i.(HeadIndexFilePair).filePath
-			return false
-		})
-		if filePath == "" {
-			f.lock.RUnlock()
-			log.Errorf("Failed: LoadCommandAt, cannot find logIndex=%v", logIndex)
-			return cmd, ErrnoToReply(unix.ENOENT)
-		}
-		var errno error
-		fd, errno = unix.Open(filePath, unix.O_RDONLY, 0644)
-		if errno != nil {
-			f.lock.RUnlock()
-			log.Errorf("Failed: LoadCommandAt, Open, filePath=%v, errno=%v", filePath, errno)
-			return cmd, ErrnoToReply(errno)
-		}
-		var bufOff = 0
-		buf := [8]byte{}
-		for bufOff < 8 {
-			var c int
-			c, errno = unix.Pread(fd, buf[bufOff:], 0)
-			if errno != nil {
-				f.lock.RUnlock()
-				log.Errorf("Failed: LoadCommandAt, Pread (0), fd=%v, bufOff=%v, errno=%v", fd, bufOff, errno)
-				return cmd, ErrnoToReply(errno)
-			}
-			if c == 0 {
-				break
-			}
-			bufOff += c
-		}
-		headIndex = binary.LittleEndian.Uint64(buf[:])
-	}
-	var ok bool
-	cmd, ok = f.cache.Get(logIndex)
-	if !ok {
-		var bufOff = 0
-		for bufOff < len(cmd.buf) {
-			c, errno := unix.Pread(fd, cmd.buf[bufOff:], 8+int64(logIndex-headIndex+1)*int64(AppendEntryCommandLogSize)+int64(bufOff))
-			if errno != nil {
-				f.lock.RUnlock()
-				log.Errorf("Failed: LoadCommandAt, Pread (1), errno=%v", errno)
-				return cmd, ErrnoToReply(errno)
-			}
-			if c == 0 {
-				break
-			}
-			bufOff += c
-		}
-	}
-	if logIndex < f.headIndex {
-		if errno := unix.Close(fd); errno != nil {
-			log.Warnf("Failed (ignore): LoadCommandAt, Close, errno=%v", errno)
+	bufs, _, errno := f.disk.Read(logOffset, int64(len(cmd.buf)))
+	if errno != nil {
+		log.Errorf("Failed: LoadCommandAt, Read, filePath=%v, logIndex=%v, headIndex=%v, errno=%v", f.disk.filePath, logIndex, f.headIndex, errno)
+	} else {
+		var c = 0
+		for _, buf := range bufs {
+			c += copy(cmd.buf[c:], buf)
 		}
 	}
 	f.lock.RUnlock()
-	return cmd, RaftReplyOk
+	return cmd, ErrnoToReply(errno)
 }
 
-func (f *LogFile) AppendCommandAt(logIndex uint64, cmd AppendEntryCommand) (reply int32) {
-	f.lock.Lock()
-	if logIndex < f.logLength {
-		f.lock.Unlock()
-		log.Errorf("Failed: AppendCommandAt, Term=%v, Index=%v (log already exists)", cmd.GetTerm(), logIndex)
-		return ErrnoToReply(unix.EEXIST)
-	}
-	f.logLength = logIndex + 1
-	fileOffset := 8 + int64(logIndex-f.headIndex+1)*int64(AppendEntryCommandLogSize)
-	fd := f.fd
-	f.lock.Unlock()
-	var bufOff = 0
-	for bufOff < len(cmd.buf) {
-		c, errno := unix.Pwrite(fd, cmd.buf[bufOff:], fileOffset+int64(bufOff))
-		if errno != nil {
-			log.Errorf("Failed: AppendCommandAt, Pwrite, fd=%v, fileOffset=%v, bufOff=%v, errno=%v", fd, fileOffset, bufOff, errno)
-			reply = ErrnoToReply(errno)
-			//TODO: handle corrupt log entry
-			return
-		}
-		bufOff += c
-	}
-	f.cache.Put(logIndex, cmd)
-	if err := unix.Fsync(f.fd); err != nil {
-		log.Errorf("Failed (ignore): AppendCommandAt, Fsync, fd=%v, errno=%v", f.fd, err)
-	}
-	log.Debugf("Success: AppendCommandAt, Term=%v, Index=%v, ExtCmdId=%v", cmd.GetTerm(), logIndex, cmd.GetExtCmdId())
-	return RaftReplyOk
-}
-
-func (f *LogFile) AppendCommand(cmd AppendEntryCommand) (logIndex uint64, reply int32) {
-	reply = RaftReplyOk
-	f.lock.Lock()
-	logIndex = f.logLength
-	f.logLength = logIndex + 1
-	fileOffset := 8 + int64(logIndex-f.headIndex+1)*int64(AppendEntryCommandLogSize)
-	fd := f.fd
-	f.lock.Unlock()
-	var bufOff = 0
-	for bufOff < len(cmd.buf) {
-		c, errno := unix.Pwrite(fd, cmd.buf[bufOff:], fileOffset+int64(bufOff))
-		if errno != nil {
-			log.Errorf("Failed: AppendCommand, Pwrite, fd=%v, fileOffset=%v, bufOff=%v, errno=%v", fd, fileOffset, bufOff, errno)
-			reply = ErrnoToReply(errno)
-			//TODO: handle corrupt log entry
-			break
-		}
-		bufOff += c
-	}
-	f.cache.Put(logIndex, cmd)
-	if err := unix.Fsync(f.fd); err != nil {
-		log.Errorf("Failed (ignore): AppendCommandAt, Fsync, fd=%v, errno=%v", f.fd, err)
+func (f *RaftLogger) AppendCommand(cmd AppendEntryCommand) (logIndex uint64, reply int32) {
+	f.lock.RLock()
+	vec, _, errno := f.disk.AppendSingleBuffer(cmd.buf[:])
+	logIndex = f.__logOffsetToLogIndex(vec.logOffset)
+	if errno != nil {
+		log.Errorf("Failed: AppendCommand, AppendSingleBuffer, logOffset=%v, errno=%v", vec.logOffset, errno)
 	}
 	//log.Debugf("Success: AppendCommand, Term=%v, Index=%v", cmd.GetTerm(), logIndex)
-	return logIndex, reply
+	f.lock.RUnlock()
+	return logIndex, ErrnoToReply(errno)
 }
 
-func (f *LogFile) SeekLog(logIndex uint64) (reply int32) {
-	f.lock.Lock()
-	if logIndex < f.headIndex {
-		var filePath = ""
-		oldHeadIndex := f.headIndex
-		f.hIdxPath.AscendGreaterOrEqual(HeadIndexFilePair{headIndex: logIndex}, func(i btree.Item) bool {
-			fPath := i.(HeadIndexFilePair).filePath
-			hIdx := i.(HeadIndexFilePair).headIndex
-			if filePath == "" {
-				filePath = fPath
-				f.headIndex = hIdx
-			} else {
-				if errno := unix.Unlink(fPath); errno != nil {
-					log.Warnf("Failed: SeekLog, Unlink, filePath=%v, errno=%v", fPath, errno)
-				}
-				f.hIdxPath.Delete(i)
-			}
-			return false
-		})
-		if filePath == "" {
-			f.lock.Unlock()
-			log.Errorf("Failed: SeekLog, cannot find logIndex=%v", logIndex)
-			return ErrnoToReply(unix.ENOENT)
-		}
-		if f.fd != -1 {
-			if errno := unix.Close(f.fd); errno != nil {
-				log.Warnf("Failed (ignore): SeekLog, Close, fd=%v, errno=%v", f.fd, errno)
-			}
-		}
-		var errno error
-		f.fd, errno = unix.Open(filePath, unix.O_RDONLY, 0644)
-		if errno != nil {
-			f.lock.Unlock()
-			log.Errorf("Failed: SeekLog, Open, filePath=%v, errno=%v", filePath, errno)
-			return ErrnoToReply(errno)
-		}
-		oldLogLength := f.logLength
-		f.logLength = logIndex + 1
-		log.Debugf("Success: SeekLog, logIndex=%v->%v, headIndex=%v->%v", oldLogLength, f.logLength, oldHeadIndex, f.headIndex)
-	} else {
-		if f.logLength > logIndex+1 {
-			length := 8 + int64(logIndex-f.headIndex+1)*int64(AppendEntryCommandLogSize)
-			if errno := unix.Ftruncate(f.fd, length); errno != nil {
-				f.lock.Unlock()
-				log.Errorf("Failed: SeekLog, Ftruncate, length=%v, errno=%v", length, errno)
-				return ErrnoToReply(errno)
-			}
-			oldLogLength := f.logLength
-			f.logLength = logIndex + 1
-			log.Debugf("Success: SeekLog, Ftruncate, logLength=%v->%v, headIndex=%v, FileLength=%v", oldLogLength, f.logLength, f.headIndex, length)
-		}
+func (f *RaftLogger) Shrink(logIndex uint64) (reply int32) {
+	f.lock.RLock()
+	newSize := f.__logIndexToLogOffset(logIndex)
+	if newSize == 0 {
+		log.Errorf("Failed: Shrink, logIndex < headIndex, filePath=%v, logIndex=%v, headIndex=%v", f.disk.filePath, logIndex, f.headIndex)
+		f.lock.RUnlock()
+		return ErrnoToReply(unix.EOVERFLOW)
 	}
-	f.cache.Clean()
-	f.lock.Unlock()
+	oldSize, errno := f.disk.Shrink(newSize)
+	if errno != nil {
+		log.Errorf("Failed: Shrink, Shrink, filePath=%v, logIndex=%v, headIndex=%v, errno=%v", f.disk.filePath, logIndex, f.headIndex, errno)
+		f.lock.RUnlock()
+		return ErrnoToReply(errno)
+	}
+	oldLogLength := f.__logOffsetToLogIndex(oldSize - int64(AppendEntryCommandLogSize))
+	log.Debugf("Success: Shrink, logLength=%v->%v, size=%v->%v", oldLogLength, logIndex, oldSize, newSize)
+	f.lock.RUnlock()
 	return RaftReplyOk
 }
 
-func (f *LogFile) GetCurrentLogLength() uint64 {
+func (f *RaftLogger) SwitchFileAndAppendCommand(cmd AppendEntryCommand) (logIndex uint64, reply int32) {
+	f.lock.Lock()
+	size := f.disk.WaitWrites()
+	newHeadIndex := f.__logOffsetToLogIndex(size)
+	reply = f.__createNewFile(newHeadIndex)
+	if reply != RaftReplyOk {
+		log.Errorf("Failed: SwitchFileAndAppendCommand, __createNewFile, filePath=%v, newHeadIndex=%v, reply=%v", f.disk.filePath, newHeadIndex, reply)
+		f.lock.Unlock()
+		return 0, reply
+	}
+	vec, _, errno := f.disk.AppendSingleBuffer(cmd.buf[:])
+	if errno != nil {
+		log.Errorf("Failed: SwitchFileAndAppendCommand, AppendSingleBuffer, filePath=%v, newHeadIndex=%v, errno=%v", f.disk.filePath, newHeadIndex, errno)
+		f.lock.Unlock()
+		return 0, ErrnoToReply(errno)
+	}
+	logIndex = f.__logOffsetToLogIndex(vec.logOffset)
+	size = f.disk.WaitWrites()
+	f.lock.Unlock()
+	log.Infof("Success: SwitchFileAndAppendCommand, filePath=%v, newHeadIndex=%v, newSize=%v, logIndex=%v, errno=%v", f.disk.filePath, newHeadIndex, size, logIndex, errno)
+	return logIndex, RaftReplyOk
+}
+
+func (f *RaftLogger) CompactLog() (reply int32) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	if f.headIndex == 1 {
+		log.Warnf("BUG: CompactLog, need SwitchFileAndAppendCommand before compaction")
+		return RaftReplyOk
+	}
+	f.disk.WaitWrites()
+	newPath := f.__getFilePath(1)
+	err := unix.Unlink(newPath)
+	if err != nil {
+		log.Errorf("Failed: CompactLog, Unlink, newPath=%v, err=%v", newPath, err)
+		return ErrnoToReply(err)
+	}
+	newDisk := NewOnDiskLog(newPath, 0, 1)
+	buf := [8]byte{}
+	binary.LittleEndian.PutUint64(buf[:], 1)
+	_, _, errno := newDisk.AppendSingleBuffer(buf[:])
+	if errno != nil {
+		newDisk.Clear()
+		log.Errorf("Failed: CompactLog, AppendSingleBuffer, errno=%v", errno)
+		return ErrnoToReply(errno)
+	}
+	bufs, _, err := f.disk.Read(8, f.disk.size)
+	if err != nil {
+		newDisk.Clear()
+		log.Errorf("Failed: CompactLog, Read, err=%v", err)
+		return ErrnoToReply(err)
+	}
+	for _, buf := range bufs {
+		_, _, err := newDisk.AppendSingleBuffer(buf)
+		if err != nil {
+			newDisk.Clear()
+			log.Errorf("Failed: CompactLog, AppendSingleBuffer, errno=%v", errno)
+			return ErrnoToReply(errno)
+		}
+	}
+	err = unix.Unlink(f.__getFilePath(f.headIndex))
+	if err != nil && err != unix.ENOENT {
+		newDisk.Clear()
+		log.Errorf("Failed: CompactLog, Unlink, err=%v", err)
+		return ErrnoToReply(err)
+	}
+	log.Infof("Success: CompactLog, headIndex=%v->1", f.headIndex)
+	f.headIndex = 1
+	f.disk = newDisk
+	return RaftReplyOk
+}
+
+func (f *RaftLogger) GetCurrentLogLength() uint64 {
+	// NOTE: wait for all outstanding writes.
 	f.lock.RLock()
-	ret := f.logLength
+	size := f.disk.WaitWrites()
+	ret := f.__logOffsetToLogIndex(size - int64(AppendEntryCommandLogSize))
 	f.lock.RUnlock()
 	return ret
 }
 
-func (f *LogFile) Clean() {
-	f.lock.Lock()
-	if f.fd != -1 {
-		if errno := unix.Close(f.fd); errno != nil {
-			log.Warnf("Failed (ignore): LogFile.Clean, Close, fd=%v, errno=%v", f.fd, errno)
-		} else {
-			f.fd = -1
-		}
-	}
-	unlinked := make([]btree.Item, 0)
-	f.hIdxPath.AscendGreaterOrEqual(HeadIndexFilePair{headIndex: 0}, func(i btree.Item) bool {
-		filePath := i.(HeadIndexFilePair).filePath
-		if err := unix.Unlink(filePath); err != nil {
-			log.Errorf("Failed (ignore): LogFile.Clean, Unlink, filePath=%v, err=%v", filePath, err)
-		} else {
-			unlinked = append(unlinked, i)
-		}
-		return true
-	})
-	for _, item := range unlinked {
-		f.hIdxPath.Delete(item)
-	}
-	f.cache.Clean()
-	f.lock.Unlock()
+func (f *RaftLogger) Clear() {
+	f.lock.RLock()
+	f.disk.Clear()
+	f.lock.RUnlock()
 }
 
-func (f *LogFile) CheckReset() (ok bool) {
+func (f *RaftLogger) CheckReset() (ok bool) {
 	if ok = f.lock.TryLock(); !ok {
-		log.Errorf("Failed: LogFile.CheckReset, f.lock is taken")
+		log.Errorf("Failed: RaftLogger.CheckReset, f.lock is taken")
 		return
 	}
-	if ok2 := f.hIdxPath.Len() == 0; !ok2 {
-		log.Errorf("Failed: LogFile.CheckReset, len(f.hIdxPath) != 0")
-		ok = false
-	}
-	if ok2 := f.cache.CheckReset(); !ok2 {
-		log.Errorf("Failed: LogFile.CheckReset, cache")
-		ok = false
-	}
-	if ok2 := f.fd == -1; !ok2 {
-		log.Errorf("Failed: LogFile.CheckReset, f.fd != -1")
+	if ok2 := f.disk.CheckReset(); !ok2 {
+		log.Errorf("Failed: RaftLogger.CheckReset, disk")
 		ok = false
 	}
 	f.lock.Unlock()
-	return
-}
-
-const (
-	RaftFileCacheLimit = 100
-)
-
-type DataCacheKey struct {
-	id     FileIdType
-	offset int64
-	length int32
-}
-
-type DataCache struct {
-	buffers        map[DataCacheKey][]byte
-	order          *list.List
-	lock           *sync.RWMutex
-	maxKeys        int
-	maxValueLength int
-}
-
-func NewDataCache(maxKeys int, maxValueLength int) *DataCache {
-	return &DataCache{
-		buffers: make(map[DataCacheKey][]byte), order: list.New(),
-		lock: new(sync.RWMutex), maxKeys: maxKeys, maxValueLength: maxValueLength,
-	}
-}
-
-func (c *DataCache) Get(id FileIdType, offset int64, length int32) ([]byte, bool) {
-	c.lock.RLock()
-	buf, ok := c.buffers[DataCacheKey{id: id, offset: offset, length: length}]
-	c.lock.RUnlock()
-	//log.Debugf("DataCache.Get, id=%v, offset=%v, length=%v, len(buf)=%v, ok=%v", id, offset, length, len(buf), ok)
-	return buf, ok
-}
-
-func (c *DataCache) Put(id FileIdType, offset int64, buf []byte) {
-	if len(buf) > c.maxValueLength {
-		return
-	}
-	c.lock.Lock()
-	if len(c.buffers) >= c.maxKeys {
-		oldest := c.order.Back()
-		c.order.Remove(oldest)
-		delete(c.buffers, oldest.Value.(DataCacheKey))
-	}
-	key := DataCacheKey{id: id, offset: offset, length: int32(len(buf))}
-	c.buffers[key] = buf
-	c.order.PushFront(key)
-	c.lock.Unlock()
-	//log.Debugf("DataCache.Put, id=%v, offset=%v, len(data)=%v, copied=%v", id, offset, len(data), copied)
-}
-
-func (c *DataCache) Close() {
-	c.lock.Lock()
-	c.buffers = make(map[DataCacheKey][]byte)
-	c.order = list.New()
-	c.lock.Unlock()
-}
-
-func (c *DataCache) CheckReset() (ok bool) {
-	if ok = c.lock.TryLock(); !ok {
-		log.Errorf("Failed: DataCache.CheckReset, c.lock is taken")
-		return
-	}
-	if ok2 := len(c.buffers) == 0; !ok2 {
-		log.Errorf("Failed: DataCache.CheckReset, len(c.buffers) != 0")
-		ok = false
-	}
-	if ok2 := c.order.Len() == 0; !ok2 {
-		log.Errorf("Failed: DataCache.CheckReset, c.order.Len() != 0")
-		ok = false
-	}
-	c.lock.Unlock()
-	return
-}
-
-type CachedFd struct {
-	id FileIdType
-	fd int
-}
-type RaftFiles struct {
-	lock           *sync.Mutex
-	filePrefix     string
-	nextOffset     map[FileIdType]int64
-	fdCache        map[FileIdType]*list.Element
-	fdList         *list.List
-	cacheLimit     int
-	dataCache      *DataCache
-	totalDiskUsage int64 //Note: currentTerm and votedFor are not counted
-}
-
-func NewRaftFileCache(filePrefix string, cacheLimit int) *RaftFiles {
-	ret := &RaftFiles{
-		lock:           new(sync.Mutex),
-		filePrefix:     filePrefix,
-		nextOffset:     nil,
-		fdCache:        nil,
-		fdList:         nil,
-		dataCache:      NewDataCache(32, 4096),
-		cacheLimit:     cacheLimit,
-		totalDiskUsage: 0,
-	}
-	ret.Reset()
-	return ret
-}
-
-func (c *RaftFiles) Reset() {
-	nextOffset := make(map[FileIdType]int64)
-	baseName := filepath.Base(c.filePrefix)
-	re := regexp.MustCompile(fmt.Sprintf("%s-([0-9-]+)-([0-9-]+).log", baseName))
-	totalDiskUsage := int64(0)
-	if dirs, err2 := os.ReadDir(filepath.Dir(c.filePrefix)); err2 == nil {
-		for _, file := range dirs {
-			f, err3 := file.Info()
-			if err3 != nil {
-				continue
-			}
-			if f.IsDir() {
-				continue
-			}
-			found := re.FindAllStringSubmatch(f.Name(), 1)
-			if len(found) <= 0 || len(found[0]) <= 1 {
-				continue
-			}
-			lower, err := strconv.ParseUint(found[0][1], 10, 64)
-			if err != nil {
-				log.Errorf("Failed: Reset, ParseUint (0), malformed log file, file=%v, err=%v", file.Name(), err)
-				continue
-			}
-			upper, err := strconv.ParseUint(found[0][2], 10, 64)
-			if err != nil {
-				log.Errorf("Failed: Reset, ParseUint (1), malformed log file, file=%v, err=%v", file.Name(), err)
-				continue
-			}
-			fileId := FileIdType{lower: uint64(lower), upper: uint64(upper)}
-			nextOffset[fileId] = f.Size()
-			totalDiskUsage += f.Size()
-			log.Infof("Reset, found existing log file, file=%v, fileId=%v, size=%v", file.Name(), fileId, f.Size())
-		}
-	}
-	c.lock.Lock()
-	c.nextOffset = nextOffset
-	c.totalDiskUsage = totalDiskUsage
-	c.clearNoLock()
-	c.lock.Unlock()
-	log.Infof("Success: Reset, totalDiskUsage=%v", totalDiskUsage)
-}
-
-func (c *RaftFiles) GetFileName(fileId FileIdType) string {
-	return fmt.Sprintf("%s-%d-%d.log", c.filePrefix, fileId.lower, fileId.upper)
-}
-
-func (c *RaftFiles) GetFileLength(fileId FileIdType) int64 {
-	c.lock.Lock()
-	length := c.nextOffset[fileId]
-	c.lock.Unlock()
-	return length
-}
-
-func (c *RaftFiles) GetDiskUsage() int64 {
-	return atomic.LoadInt64(&c.totalDiskUsage)
-}
-
-func (c *RaftFiles) AddDiskUsage(size int64) int64 {
-	return atomic.AddInt64(&c.totalDiskUsage, size)
-}
-
-func (c *RaftFiles) Open(fileId FileIdType, mode int) (int, error) {
-	fileName := c.GetFileName(fileId)
-	fd, errno := unix.Open(fileName, mode, 0644)
-	if errno != nil {
-		log.Errorf("Failed: RaftFiles.Open, fileName=%v, mode=%v, errno=%v", fileName, mode, errno)
-		return -1, errno
-	}
-	return fd, errno
-}
-
-func (c *RaftFiles) openCacheNoLock(fileId FileIdType) (int, int32) {
-	if !fileId.IsValid() {
-		log.Errorf("Failed: openCacheNoLock, fileId is invalid, fileId=%v", fileId)
-		return -1, ErrnoToReply(unix.EINVAL)
-	}
-	element, ok := c.fdCache[fileId]
-	if ok {
-		c.fdList.MoveToFront(element)
-		return element.Value.(*CachedFd).fd, RaftReplyOk
-	}
-	fileName := c.GetFileName(fileId)
-	fd, errno := unix.Open(fileName, unix.O_RDWR|unix.O_CREAT|unix.O_SYNC, 0644)
-	if errno != nil {
-		log.Errorf("Failed: RaftFiles.Get, openCacheNoLock, fileName=%v, errno=%v", fileName, errno)
-		return -1, ErrnoToReply(errno)
-	}
-	if c.cacheLimit <= c.fdList.Len()+1 {
-		last := c.fdList.Back()
-		c.fdList.Remove(last)
-		entry := last.Value.(*list.Element).Value.(*CachedFd)
-		_ = unix.Close(entry.fd)
-		delete(c.fdCache, entry.id)
-	}
-	element = &list.Element{Value: &CachedFd{id: fileId, fd: fd}}
-	c.fdList.PushFront(element)
-	c.fdCache[fileId] = element
-	return fd, RaftReplyOk
-}
-
-func (c *RaftFiles) Splice(pipeFds [2]int, fileId FileIdType, fd int, offset int64, dataLength int32, bufOff *int32) (err error) {
-	fileName := c.GetFileName(fileId)
-	var toFd int
-	toFd, err = unix.Open(fileName, unix.O_WRONLY|unix.O_CREAT, 0644)
-	if err != nil {
-		log.Errorf("Failed: RaftFiles.Splice, Open, fileId=%v, err=%v", fileId, err)
-		return
-	}
-	//beginOffset := offset + int64(*bufOff)
-	var count = int64(0)
-	//var newDiskUsage = int64(0)
-	for *bufOff < dataLength {
-		var nRead int64
-		nRead, err = unix.Splice(fd, nil, pipeFds[1], nil, int(dataLength-*bufOff), unix.SPLICE_F_MOVE|unix.SPLICE_F_NONBLOCK)
-		if nRead == 0 || err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-			err = nil
-			break
-		} else if err != nil {
-			log.Errorf("Failed: RaftFiles.Splice, Splice (0), nfd=%v, pipeFds[1]=%v, bodyLength=%v, err=%v", fd, pipeFds[1], dataLength, err)
-			goto close
-		}
-		bodyOff := offset + int64(*bufOff)
-		for nRead > 0 {
-			var l2 = int(nRead & int64(math.MaxInt))
-			var nWrite int64
-			nWrite, err = unix.Splice(pipeFds[0], nil, toFd, &bodyOff, l2, unix.SPLICE_F_MOVE)
-			if err != nil {
-				log.Errorf("Failed: RaftFiles.Splice, Splice (1), pipeFds[0]=%v, toFd=%v, l2=%v, offset=%v, err=%v", pipeFds[0], toFd, l2, bodyOff, err)
-				goto close
-			}
-			if nWrite == 0 {
-				break
-			}
-			nRead -= nWrite
-			*bufOff += int32(nWrite)
-			count += nWrite
-		}
-	}
-	if err2 := unix.Fsync(toFd); err2 != nil {
-		log.Warnf("Failed (ignore): RaftFiles.Splice, Fsync, fd=%v, err=%v", fd, err2)
-	}
-	/*if err2 := unix.Fadvise(toFd, beginOffset, count, unix.FADV_DONTNEED); err2 != nil {
-		log.Warnf("Failed (ignore): RaftFiles.Splice, Fadvise, fd=%v, err=%v", fd, err2)
-	}*/
-	//log.Debugf("Success: RaftFiles.Splice, newDiskUsage=%v, count=%v", newDiskUsage, count)
-close:
-	if err2 := unix.Close(toFd); err2 != nil {
-		log.Warnf("Failed (ignore): RaftFiles.Splice, Close, toFd=%v, err=%v", toFd, err2)
-	}
-	return
-}
-
-func (c *RaftFiles) SyncWrite(fileId FileIdType, buf []byte) (offset int64, length int32, reply int32) {
-	var begin, copy, write, fsync time.Time
-	begin = time.Now()
-	c.lock.Lock()
-	var ok bool
-	offset, ok = c.nextOffset[fileId]
-	if !ok {
-		offset = 0
-	}
-	c.nextOffset[fileId] = offset + int64(len(buf))
-	c.AddDiskUsage(int64(length))
-	c.lock.Unlock()
-
-	fileName := c.GetFileName(fileId)
-	bufSlice := (*reflect.SliceHeader)(unsafe.Pointer(&buf))
-	mode := unix.O_WRONLY | unix.O_SYNC | unix.O_CREAT
-	var dst []byte = buf
-	//var pages *PageBuffer = nil
-	bufAligned := bufSlice.Data%uintptr(SectorSize) == 0
-	/*if !bufAligned {
-		var err error
-		pages, err = GetPageBuffer(int64(len(buf)))
-		if err == nil {
-			dst = pages.Buf
-			bufAligned = true
-			memcpy(dst, buf)
-		}
-	}*/
-	copy = time.Now()
-	if bufAligned && len(dst)%SectorSize == 0 && offset%int64(SectorSize) == 0 {
-		mode |= unix.O_DIRECT
-	}
-	fd, err := unix.Open(fileName, mode, 0644)
-	if err != nil {
-		log.Errorf("Failed: RaftFiles.SyncWrite, fileName=%v, directIO=%v, errno=%v", fileName, mode&unix.O_DIRECT != 0, err)
-		reply = ErrnoToReply(err)
-		goto put
-	}
-	length = 0
-	for length < int32(len(dst)) {
-		var c int
-		c, err = unix.Pwrite(fd, dst[length:], offset+int64(length))
-		if err != nil {
-			log.Errorf("Failed: RaftFiles.SyncWrite, Pwrite, fileId=%v, fd=%v, offset=%v, length=%v, directIO=%v, err=%v",
-				fileId, fd, offset, length, mode&unix.O_DIRECT != 0, err)
-			reply = ErrnoToReply(err)
-			goto out
-		}
-		length += int32(c)
-	}
-	write = time.Now()
-	if err = unix.Fsync(fd); err != nil {
-		log.Errorf("Failed: RaftFiles.SyncWrite, Fsync, fileId=%v, fd=%v, offset=%v, length=%v, directIO=%v, err=%v",
-			fileId, fd, offset, length, mode&unix.O_DIRECT != 0, err)
-		reply = ErrnoToReply(err)
-		goto out
-	}
-	if mode&unix.O_DIRECT == 0 {
-		if err = unix.Fadvise(fd, 0, 0, unix.FADV_DONTNEED); err != nil {
-			log.Errorf("Failed (ignore): RaftFiles.SyncWrite, Fadvise, fileId=%v, fd=%v, offset=%v, length=%v, directIO=%v, err=%v",
-				fileId, fd, offset, length, mode&unix.O_DIRECT != 0, err)
-		}
-	}
-	fsync = time.Now()
-	reply = ErrnoToReply(err)
-	log.Debugf("Success: RaftFiles.SyncWrite, fileId=%v, offset=%v, length=%v, directIO=%v (bufAligned == %v, len(dst)%%SectorSize == %v, offset%%SectorSize == %v), copy=%v, write=%v, fsync=%v, elapsed=%v",
-		fileId, offset, length, mode&unix.O_DIRECT != 0, bufAligned, len(dst)%SectorSize, offset%int64(SectorSize),
-		copy.Sub(begin), write.Sub(copy), fsync.Sub(write), fsync.Sub(begin),
-	)
-out:
-	if err2 := unix.Close(fd); err2 != nil {
-		log.Errorf("Failed (ignore): RaftFiles.SyncWrite, Close, fileId=%v, fd=%v, err=%v", fileId, fd, err2)
-	}
-put:
-	/*if pages != nil {
-		ReturnPageBuffer(pages)
-	}*/
-	return
-}
-
-func (c *RaftFiles) OpenAndWriteCache(fileId FileIdType, buf []byte) (offset int64, length int32, reply int32) {
-	c.lock.Lock()
-	var ok bool
-	offset, ok = c.nextOffset[fileId]
-	if !ok {
-		offset = 0
-	}
-	c.nextOffset[fileId] = offset + int64(len(buf))
-	var fd int
-	fd, reply = c.openCacheNoLock(fileId)
-	c.AddDiskUsage(int64(length))
-	c.lock.Unlock()
-
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: RaftFiles.OpenAndWriteCache, fileId=%v, reply=%v", fileId, reply)
-		return
-	}
-	length = 0
-	for length < int32(len(buf)) {
-		c, errno := unix.Pwrite(fd, buf[length:], offset+int64(length))
-		if errno != nil {
-			log.Errorf("Failed: RaftFiles.OpenAndWriteCache, Pwrite, fileId=%v, fd=%v, offset=%v, length=%v, errno=%v",
-				fileId, fd, offset, length, errno)
-			reply = ErrnoToReply(errno)
-			return
-		}
-		length += int32(c)
-	}
-	if errno := unix.Fsync(fd); errno != nil {
-		log.Errorf("Failed: RaftFiles.OpenAndWriteCache, Fsync, fileId=%v, fd=%v, offset=%v, length=%v, errno=%v",
-			fileId, fd, offset, length, errno)
-	}
-	//log.Debugf("Success: RaftFiles.OpenAndWriteCache, fileId=%v, newDiskUsage=%v, length=%v", fileId, newDiskUsage, length)
-	return
-}
-
-func (c *RaftFiles) OpenAndReadCache(fileId FileIdType, offset int64, length int32) ([]byte, int32) {
-	if buf, ok := c.dataCache.Get(fileId, offset, length); ok {
-		return buf, RaftReplyOk
-	}
-	c.lock.Lock()
-	fd, reply := c.openCacheNoLock(fileId)
-	c.lock.Unlock()
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: RaftFiles.OpenAndReadCache, openCacheNoLock, fileId=%v, reply=%v", fileId, reply)
-		return nil, reply
-	}
-	buf := make([]byte, length)
-	var bufOff = int32(0)
-	for bufOff < length {
-		r, errno := unix.Pread(fd, buf[bufOff:], offset+int64(bufOff))
-		if errno != nil {
-			log.Errorf("Failed: RaftFiles.OpenAndReadCache, ReadAt, offset=%v, bufOff=%v, length=%v, errno=%v", offset, bufOff, length, errno)
-			return nil, ErrnoToReply(errno)
-		}
-		if r == 0 {
-			break
-		}
-		bufOff += int32(r)
-	}
-	return buf, RaftReplyOk
-}
-
-func (c *RaftFiles) ReserveRange(fileId FileIdType, dataLen int64) (offset int64) {
-	c.lock.Lock()
-	offset = c.nextOffset[fileId]
-	c.nextOffset[fileId] = offset + dataLen
-	c.AddDiskUsage(dataLen)
-	c.lock.Unlock()
-	return offset
-}
-
-func (c *RaftFiles) SeekRange(fileId FileIdType, newNextOffset int64) {
-	c.lock.Lock()
-	offset := c.nextOffset[fileId]
-	if offset < newNextOffset {
-		c.nextOffset[fileId] = newNextOffset
-		c.AddDiskUsage(newNextOffset - offset)
-	}
-	c.lock.Unlock()
-}
-
-func (c *RaftFiles) Remove(fileId FileIdType) (int64, error) {
-	c.lock.Lock()
-	if element, ok := c.fdCache[fileId]; ok {
-		entry := element.Value.(*CachedFd)
-		_ = unix.Close(entry.fd)
-		c.fdList.Remove(element)
-		delete(c.fdCache, fileId)
-	}
-	fileName := c.GetFileName(fileId)
-	stat := unix.Stat_t{}
-	err := unix.Stat(fileName, &stat)
-	if err != nil {
-		c.lock.Unlock()
-		if err != unix.ENOENT {
-			log.Errorf("Failed: RaftFiles.Remove, Stat, fileName=%v, err=%v", fileName, err)
-			return 0, err
-		}
-		return 0, nil
-	}
-	err = unix.Unlink(fileName)
-	if err != nil {
-		c.lock.Unlock()
-		log.Errorf("Failed: RaftFiles.Remove, Unlink, fileName=%v, err=%v", fileName, err)
-		return 0, err
-	}
-	delete(c.nextOffset, fileId)
-	newDiskUsage := c.AddDiskUsage(-stat.Size)
-	c.lock.Unlock()
-	log.Debugf("Success: RaftFiles.Remove, fileId=%v, newDiskUsage=%v, stat.Size=%v", fileId, newDiskUsage, stat.Size)
-	return stat.Size, nil
-}
-
-func (c *RaftFiles) DontNeed(fileId FileIdType) {
-	c.lock.Lock()
-	fileName := c.GetFileName(fileId)
-	offset, ok := c.nextOffset[fileId]
-	if !ok || offset == 0 {
-		c.lock.Unlock()
-		return
-	}
-	fd, err := unix.Open(fileName, unix.O_RDONLY, 0644)
-	if err != nil {
-		c.lock.Unlock()
-		log.Warnf("Failed: RaftFiles.DontNeed, OpenFile, fileName=%v, err=%v", fileName, err)
-		return
-	}
-	if err = unix.Fadvise(fd, 0, offset, unix.FADV_DONTNEED); err != nil {
-		log.Warnf("Failed: RaftFiles.DontNeed, Fadvise, fileId=%v, length=%v, err=%v", fileId, offset, err)
-		// fall through to close
-	}
-	if err = unix.Close(fd); err != nil {
-		log.Warnf("Failed: RaftFiles.DontNeed, Close, fileNaem=%v, err=%v", fileName, err)
-	}
-	c.lock.Unlock()
-}
-
-func (c *RaftFiles) Clear() {
-	c.lock.Lock()
-	c.clearNoLock()
-	c.lock.Unlock()
-}
-
-func (c *RaftFiles) clearNoLock() {
-	for _, element := range c.fdCache {
-		entry := element.Value.(*CachedFd)
-		_ = unix.Close(entry.fd)
-	}
-	c.fdCache = make(map[FileIdType]*list.Element)
-	c.fdList = list.New()
-	c.dataCache = NewDataCache(32, 4096)
-	//c.totalDiskUsage = 0 // intentionally avoid clearing this. bugs raise check errors later
-	c.nextOffset = make(map[FileIdType]int64)
-}
-
-func (c *RaftFiles) CheckReset() (ok bool) {
-	if ok = c.lock.TryLock(); !ok {
-		log.Errorf("Failed: RaftFiles.CheckReset, c.lock is taken")
-		return
-	}
-	if ok2 := len(c.fdCache) == 0; !ok2 {
-		log.Errorf("Failed: RaftFiles.CheckReset, len(c.fdCache) != 0")
-		ok = false
-	}
-	if ok2 := c.fdList.Len() == 0; !ok2 {
-		log.Errorf("Failed: RaftFiles.CheckReset, c.fdList.Len() != 0")
-		ok = false
-	}
-	if ok2 := c.dataCache.CheckReset(); !ok2 {
-		log.Errorf("Failed: RaftFiles.CheckReset, c.dataCache")
-		ok = false
-	}
-	if ok2 := c.totalDiskUsage == 0; !ok2 {
-		log.Errorf("Failed: RaftFiles.CheckReset, c.totalDiskUsage != 0")
-		ok = false
-	}
-	if ok2 := len(c.nextOffset) == 0; !ok2 {
-		log.Errorf("Failed: RaftFiles.CheckReset, len(c.nextOffset) != 0")
-		ok = false
-	}
-	c.lock.Unlock()
-	return
-}
-
-const RaftPersistStateReset = uint32(math.MaxUint32)
-
-func IsReset(value uint32) bool {
-	return value == RaftPersistStateReset
-}
-
-type RaftPersistState struct {
-	fileName string
-	fd       int
-	offset   int64
-	value    uint32
-	lock     *sync.RWMutex
-}
-
-func NewRaftPersistState(rootDir string, selfId uint32, stateName string) (*RaftPersistState, int32) {
-	fileName := fmt.Sprintf("%s/%d-%s.log", rootDir, selfId, stateName)
-	ret := &RaftPersistState{lock: new(sync.RWMutex), value: RaftPersistStateReset, fileName: fileName}
-	st := unix.Stat_t{}
-	errno := unix.Stat(fileName, &st)
-	if errno == nil {
-		var fd int
-		fd, errno = unix.Open(fileName, unix.O_RDWR, 0644)
-		if errno != nil {
-			log.Errorf("Failed: NewRaftPersistState, OpenFileHandle (0), fileName=%v, errno=%v", fileName, errno)
-			return nil, ErrnoToReply(errno)
-		}
-		var restore = false
-		if st.Size >= int64(SizeOfUint32) {
-			buf := [SizeOfUint32]byte{}
-			if _, errno = unix.Pread(fd, buf[:], st.Size-int64(SizeOfUint32)); errno != nil {
-				log.Errorf("Failed: NewRaftPersistState, ReadAt, fileName=%v, at=%v, err=%v", fileName, st.Size-int64(SizeOfUint32), errno)
-				return nil, ErrnoToReply(errno)
-			}
-			restore = true
-			ret.value = binary.LittleEndian.Uint32(buf[:])
-		}
-		ret.fd = fd
-		if restore {
-			log.Debugf("Restore: NewRaftPersistState, h=%v, selfId=%v, value=%v", stateName, selfId, ret.value)
-		}
-	} else if errno != unix.ENOENT {
-		log.Errorf("Failed: NewRaftPersistState, Stat, fileName=%v, errno=%v", fileName, errno)
-		return nil, ErrnoToReply(errno)
-	} else {
-		fd, err := unix.Open(fileName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL, 0644)
-		if err != nil {
-			log.Errorf("Failed: NewRaftPersistState, OpenFileHandle, fileName=%v, err=%v", fileName, err)
-			return nil, ErrnoToReply(errno)
-		}
-		ret.fd = fd
-	}
-	return ret, RaftReplyOk
-}
-
-func (s *RaftPersistState) __setNoLock(value uint32) int32 {
-	if value == s.value {
-		return RaftReplyOk
-	}
-	buf := [SizeOfUint32]byte{}
-	binary.LittleEndian.PutUint32(buf[:], value)
-	var bufOff = 0
-	for bufOff < len(buf) {
-		c, errno := unix.Pwrite(s.fd, buf[bufOff:], s.offset+int64(bufOff))
-		if errno != nil {
-			log.Errorf("Failed: RaftPersistState.__setNoLock, Pwrite, fileName=%v, offset=%v, bufOff=%v, errno=%v", s.fileName, s.offset, bufOff, errno)
-			return ErrnoToReply(errno)
-		}
-		bufOff += c
-	}
-	s.offset += int64(bufOff)
-	log.Debugf("RaftPersistState, %v: %v -> %v", s.fileName, s.value, value)
-	s.value = value
-	return RaftReplyOk
-}
-
-func (s *RaftPersistState) Set(value uint32) int32 {
-	s.lock.Lock()
-	reply := s.__setNoLock(value)
-	s.lock.Unlock()
-	return reply
-}
-
-func (s *RaftPersistState) Increment() int32 {
-	s.lock.Lock()
-	s.__setNoLock(s.value + 1)
-	s.lock.Unlock()
-	return RaftReplyOk
-}
-
-func (s *RaftPersistState) Reset() int32 {
-	return s.Set(RaftPersistStateReset)
-}
-
-func (s *RaftPersistState) Get() uint32 {
-	s.lock.RLock()
-	v := s.value
-	s.lock.RUnlock()
-	return v
-}
-
-func (s *RaftPersistState) Clean() {
-	s.lock.Lock()
-	if s.fd > 0 {
-		if err := unix.Close(s.fd); err != nil {
-			log.Errorf("Failed: RaftPersistState.Clean, Close, fileName=%v, fd=%v, err=%v", s.fileName, s.fd, err)
-		} else {
-			s.fd = -1
-		}
-	}
-	if s.fileName != "" {
-		if err := unix.Unlink(s.fileName); err != nil {
-			log.Errorf("Failed: RaftPersistState, Unlink, fileName=%v, err=%v", s.fileName, err)
-		} else {
-			s.fileName = ""
-		}
-	}
-	s.lock.Unlock()
-}
-
-func (s *RaftPersistState) CheckReset() (ok bool) {
-	if ok = s.lock.TryLock(); !ok {
-		log.Errorf("Failed: RaftPersistState.CheckReset, s.lock is taken")
-		return
-	}
-	if ok2 := s.fd == -1; !ok2 {
-		log.Errorf("Failed: RaftPersistState.CheckReset, s.fd != -1")
-		ok = false
-	}
-	if ok2 := s.fileName == ""; !ok2 {
-		log.Errorf("Failed: RaftPersistState.CheckReset, s.fileName != \"\"")
-		ok = false
-	}
-	s.lock.Unlock()
 	return
 }
 
@@ -1388,8 +311,8 @@ type RaftInstance struct {
 	stopped        int32
 	nrThreads      int32
 	maxHBBytes     int
-	resumeCallback func()
-	applyCallback  func(*AppendEntryCommand) int32
+	resumeCallback func(*NodeServer) int32
+	nodeServer     *NodeServer
 	rpcClient      *RpcClient
 	replyClient    *RpcReplyClient
 	rpcServer      *RpcThreads
@@ -1397,15 +320,15 @@ type RaftInstance struct {
 	sas            map[common.NodeAddrInet4]uint32
 
 	// Extended log information
-	files         *RaftFiles
-	extNextSeqNum uint32
-	extLogFileId  FileIdType
-	extLock       *sync.RWMutex
+	extLogger       *OnDiskLogger
+	extNextSeqNum   uint32
+	extRaftLoggerId LogIdType
+	extLock         *sync.RWMutex
 
 	// Persistent state on all servers: (Updated on stable storage before responding to RPCs)
-	log         *LogFile          // log entries; each entry contains command for state machine, and Term when entry was received by leader (first reqId is 1)
-	currentTerm *RaftPersistState // latest Term server has seen (initialized to 0 on first boot, increases monotonically)
-	votedFor    *RaftPersistState // candidateId that received vote in current Term (or null if none) (NOTE: null -> uint32 MAX)
+	log         *RaftLogger  // log entries; each entry contains command for state machine, and Term when entry was received by leader (first reqId is 1)
+	currentTerm *OnDiskState // latest Term server has seen (initialized to 0 on first boot, increases monotonically)
+	votedFor    *OnDiskState // candidateId that received vote in current Term (or null if none) (NOTE: null -> uint32 MAX)
 
 	// Volatile state on all servers:
 	commitIndex uint64 // reqId of highest log entry known to be committed (initialized to 0, increases monotonically)
@@ -1414,11 +337,13 @@ type RaftInstance struct {
 	// Volatile state on leaders: (Reinitialized after election)
 	nextIndex  map[uint32]uint64 // for each server, reqId of the next log entry to send to that server (initialized to leader last log reqId + 1)
 	matchIndex map[uint32]uint64 // for each server, reqId of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
+
+	replaying bool
 }
 
 func (n *RaftInstance) IsLeader() (r RaftBasicReply) {
 	n.lock.RLock()
-	if n.leaderId == RaftPersistStateReset {
+	if n.leaderId == OnDiskStateReset {
 		r = RaftBasicReply{reply: RaftReplyVoting}
 	} else if n.selfId != n.leaderId || n.state != RaftLeader {
 		r = RaftBasicReply{reply: RaftReplyNotLeader, leaderId: n.leaderId, leaderAddr: n.serverIds[n.leaderId]}
@@ -1429,9 +354,17 @@ func (n *RaftInstance) IsLeader() (r RaftBasicReply) {
 	return r
 }
 
-func (n *RaftInstance) GetExtFileId() FileIdType {
+func (n *RaftInstance) GetExtLogId() LogIdType {
 	n.extLock.RLock()
-	ret := n.extLogFileId
+	ret := n.extRaftLoggerId
+	n.extLock.RUnlock()
+	return ret
+}
+
+func (n *RaftInstance) GetExtLogIdForLogCompaction() LogIdType {
+	n.extLock.RLock()
+	ret := n.extRaftLoggerId
+	ret.upper += 1
 	n.extLock.RUnlock()
 	return ret
 }
@@ -1444,19 +377,25 @@ func (n *RaftInstance) GenerateCoordinatorId() CoordinatorId {
 	return CoordinatorId{clientId: n.selfId, seqNum: seqNum}
 }
 
-func (n *RaftInstance) SetExt(fileId uint64, seqNum uint32) {
+func (n *RaftInstance) SetExt(logId uint32, seqNum uint32) {
 	n.extLock.Lock()
-	n.extLogFileId = FileIdType{lower: 0, upper: fileId}
+	n.extRaftLoggerId = LogIdType{lower: 0, upper: logId}
 	n.extNextSeqNum = seqNum
 	n.extLock.Unlock()
 }
 
-func (n *RaftInstance) CleanExtFile() {
+func (n *RaftInstance) SwitchExtLog(logId uint32) {
 	n.extLock.Lock()
-	if _, err := n.files.Remove(n.extLogFileId); err != nil {
-		log.Errorf("Failed: CleanExtFile, Remove, extLogFileId=%v, err=%v", n.extLogFileId, err)
+	n.extRaftLoggerId = LogIdType{lower: 0, upper: logId}
+	n.extLock.Unlock()
+}
+
+func (n *RaftInstance) CleanExtLogger() {
+	n.extLock.Lock()
+	if _, err := n.extLogger.Remove(n.extRaftLoggerId); err != nil {
+		log.Errorf("Failed: CleanExtLogger, Remove, extRaftLoggerId=%v, err=%v", n.extRaftLoggerId, err)
 	} else {
-		n.extLogFileId = FileIdType{lower: 0, upper: 0}
+		n.extRaftLoggerId = LogIdType{lower: 0, upper: 0}
 		n.extNextSeqNum = 0
 	}
 	n.extLock.Unlock()
@@ -1548,7 +487,7 @@ func (n *RaftInstance) AppendEntriesRpcTopHalf(msg RpcMsg, sa common.NodeAddrIne
 	return
 fail:
 	msg.FillAppendEntriesResponseArgs(currentTerm, false, currentLogLength, reply)
-	if reply = n.replyClient.ReplyRpcMsg(msg, fd, sa, n.files, n.hbInterval, nil); reply != RaftReplyOk {
+	if reply = n.replyClient.ReplyRpcMsg(msg, fd, sa, n.extLogger, n.hbInterval, nil); reply != RaftReplyOk {
 		log.Errorf("Failed: AppendEntriesRpcTopHalf, ReplyRpcMsg, reply=%v", reply)
 	}
 	return
@@ -1563,16 +502,17 @@ func (n *RaftInstance) AppendEntriesRpcBottomHalf(msg RpcMsg, sa common.NodeAddr
 	for newIndex := prevLogIndex + 1; newIndex < currentLogLength && newIndex < prevLogIndex+1+uint64(nrEntries); newIndex++ {
 		currentCmd, currentCmdFound := n.log.LoadCommandAt(newIndex)
 		if currentCmdFound == RaftReplyOk && currentCmd.GetTerm() != term {
-			if reply := n.log.SeekLog(newIndex); reply != RaftReplyOk {
+			if reply := n.log.Shrink(newIndex); reply != RaftReplyOk {
 				msg = RpcMsg{}
 				currentTerm := n.currentTerm.Get()
 				msg.FillAppendEntriesResponseArgs(currentTerm, true, currentLogLength, reply)
-				log.Errorf("Failed: AppendEntriesRpcBottomHalf, SeekLog, newIndex=%v, reply=%v", newIndex, reply)
-				if reply := n.replyClient.ReplyRpcMsg(msg, fd, sa, n.files, n.hbInterval, nil); reply != RaftReplyOk {
+				log.Errorf("Failed: AppendEntriesRpcBottomHalf, Shrink, newIndex=%v, reply=%v", newIndex, reply)
+				if reply := n.replyClient.ReplyRpcMsg(msg, fd, sa, n.extLogger, n.hbInterval, nil); reply != RaftReplyOk {
 					log.Errorf("Failed: AppendEntriesRpcBottomHalf, ReplyRpcMsg, term=%v, logLength=%v, leaderCommit=%v, reply=%v", currentTerm, currentLogLength, leaderCommit, reply)
 				}
 				return
 			}
+			currentLogLength = n.log.GetCurrentLogLength()
 			break
 		}
 	}
@@ -1583,21 +523,47 @@ func (n *RaftInstance) AppendEntriesRpcBottomHalf(msg RpcMsg, sa common.NodeAddr
 	hadEntry = false
 	var i = uint64(0)
 	cmds := make([]*AppendEntryCommand, 0)
+	extLogCmds := make([]ExtLogCommandImpl, 0)
 	if 0 < optHeaderLength {
 		for off := uint16(RpcOptControlHeaderLength); off < optHeaderLength; {
 			cmd, nextOff := msg.GetAppendEntryCommandDiskFormat(off)
-			if reply := n.log.AppendCommandAt(prevLogIndex+1+i, cmd); reply != RaftReplyOk {
+			var reply int32
+			if currentLogLength == prevLogIndex+i {
+				currentLogLength, reply = n.log.AppendCommand(cmd)
+				if reply == RaftReplyOk {
+					log.Debugf("AppendEntriesRpcBottomHalf, AppendCommandAt, Index=%v, extCmdId=%v, off=%v, nextOff=%v", prevLogIndex+1+i, cmd.GetExtCmdId(), off, nextOff)
+				} else {
+					log.Errorf("Failed: AppendEntriesRpcBottomHalf, AppendCommandAt, Index=%v, extCmdId=%v, reply=%v", prevLogIndex+1+i, cmd.GetExtCmdId(), reply)
+				}
+			} else {
+				cmd, reply = n.log.LoadCommandAt(prevLogIndex + i + 1)
+				if reply == RaftReplyOk {
+					log.Warnf("AppendEntriesRpcBottomHalf, skip duplicated AppendCommand, Index=%v, extCmdId=%v, currentLogIndex=%v",
+						prevLogIndex+1+i, cmd.GetExtCmdId(), currentLogLength)
+				} else {
+					log.Errorf("Failed: AppendEntriesRpcBottomHalf, LoadCommandAt, Index=%v, extCmdId=%v, reply=%v", prevLogIndex+1+i, cmd.GetExtCmdId(), reply)
+				}
+				currentLogLength = prevLogIndex + i + 1
+			}
+			if reply == RaftReplyOk {
+				extLogCmd, err := LoadExtBuf(n.extLogger, &cmd)
+				if err == nil {
+					extLogCmds = append(extLogCmds, extLogCmd)
+				} else {
+					log.Errorf("Failed: AppendEntriesRpcBottomHalf, LoadExtBuf, Index=%v, extCmdId=%v, err=%v", prevLogIndex+1+i, cmd.GetExtCmdId(), err)
+					reply = ErrnoToReply(err)
+				}
+			}
+			if reply != RaftReplyOk {
 				msg = RpcMsg{}
 				currentTerm := n.currentTerm.Get()
 				msg.FillAppendEntriesResponseArgs(currentTerm, true, currentLogLength, reply)
-				log.Errorf("Failed: AppendEntriesRpcBottomHalf, AppendCommandAt, Index=%v, extCmdId=%v, reply=%v", prevLogIndex+1+i, cmd.GetExtCmdId(), reply)
-				if reply := n.replyClient.ReplyRpcMsg(msg, fd, sa, n.files, n.hbInterval, nil); reply != RaftReplyOk {
+				if reply := n.replyClient.ReplyRpcMsg(msg, fd, sa, n.extLogger, n.hbInterval, nil); reply != RaftReplyOk {
 					log.Errorf("Failed: AppendEntriesRpcBottomHalf, ReplyRpcMsg, term=%v, logLength=%v, leaderCommit=%v, reply=%v", currentTerm, currentLogLength, leaderCommit, reply)
 				}
 				return
 			}
 			cmds = append(cmds, &cmd)
-			log.Debugf("AppendEntriesRpcBottomHalf, AppendCommandAt, Index=%v, extCmdId=%v, off=%v, nextOff=%v", prevLogIndex+1+i, cmd.GetExtCmdId(), off, nextOff)
 			hadEntry = true
 			off = nextOff
 			i += 1
@@ -1621,14 +587,14 @@ func (n *RaftInstance) AppendEntriesRpcBottomHalf(msg RpcMsg, sa common.NodeAddr
 	updateCommitIndexTime := time.Now()
 
 	for j := uint64(0); j < i-1; j += 1 {
-		currentLogLength = n.ApplyAll(cmds[j], prevLogIndex+1+j)
+		n.ApplyAll(cmds[j], prevLogIndex+1+j, extLogCmds[j])
 	}
 	apply := time.Now()
 
 	msg = RpcMsg{}
 	currentTerm := n.currentTerm.Get()
 	msg.FillAppendEntriesResponseArgs(currentTerm, true, currentLogLength, RaftReplyOk)
-	if reply := n.replyClient.ReplyRpcMsg(msg, fd, sa, n.files, n.hbInterval, nil); reply != RaftReplyOk {
+	if reply := n.replyClient.ReplyRpcMsg(msg, fd, sa, n.extLogger, n.hbInterval, nil); reply != RaftReplyOk {
 		log.Errorf("Failed: AppendEntriesRpcBottomHalf, ReplyRpcMsg, term=%v, logLength=%v, leaderCommit=%v, reply=%v", currentTerm, currentLogLength, leaderCommit, reply)
 		return
 	}
@@ -1666,7 +632,7 @@ func (n *RaftInstance) HandleAppendEntriesResponse(msg RpcMsg, sa common.NodeAdd
 			}
 			n.lock.Lock()
 			n.state = RaftFollower
-			n.leaderId = RaftPersistStateReset
+			n.leaderId = OnDiskStateReset
 			n.lock.Unlock()
 			log.Infof("HandleAppendEntriesResponse, converted to follower state from leader")
 			return RaftReplyNotLeader
@@ -1695,7 +661,7 @@ func (n *RaftInstance) HandleAppendEntriesResponse(msg RpcMsg, sa common.NodeAdd
 	return RaftReplyOk
 }
 
-func (n *RaftInstance) ReplicateLog(lastLogIndex uint64, added *uint32, addedSa *common.NodeAddrInet4, removedNodeId *uint32, cmd *AppendEntryCommand) (reply int32) {
+func (n *RaftInstance) ReplicateLog(lastLogIndex uint64, added *uint32, addedSa *common.NodeAddrInet4, removedNodeId *uint32, cmd *AppendEntryCommand, extLogCmd ExtLogCommandImpl) (reply int32) {
 	begin := time.Now()
 	if reply = n.heartBeatOneRound(&lastLogIndex, added, addedSa, removedNodeId); reply != RaftReplyOk {
 		elapsed := time.Since(begin)
@@ -1708,24 +674,53 @@ func (n *RaftInstance) ReplicateLog(lastLogIndex uint64, added *uint32, addedSa 
 		n.commitIndex = lastLogIndex
 	}
 	n.lock.Unlock()
-	_ = n.ApplyAll(cmd, lastLogIndex)
+	n.ApplyAll(cmd, lastLogIndex, extLogCmd)
 
 	log.Debugf("Success: ReplicateLog, lastLogIndex=%v, hb=%v, apply=%v", lastLogIndex, endHb.Sub(begin), time.Since(endHb))
 	return RaftReplyOk
 }
 
-func (n *RaftInstance) AppendEntriesLocal(cmd AppendEntryCommand) (ret interface{}, lastLogIndex uint64, reply int32) {
+func (n *RaftInstance) SwitchFileAndAppendEntriesLocal(rc RaftCommand, extLogCmd ExtLogCommandImpl) (ret interface{}, lastLogIndex uint64, reply int32) {
+	if r := n.IsLeader(); r.reply != RaftReplyOk {
+		return nil, 0, r.reply
+	}
+	if len(n.serverIds) > 1 {
+		log.Errorf("Not implemented: SwitchFileAndAppendEntriesLocal, need to implement new RPC for switching logs at followers")
+		return nil, 0, ErrnoToReply(unix.ENOSPC)
+	}
+	//begin := time.Now()
+	cmd := GetAppendEntryCommand(n.currentTerm.Get(), rc)
+	lastLogIndex, reply = n.log.SwitchFileAndAppendCommand(cmd)
+	if reply != RaftReplyOk {
+		log.Errorf("Failed: SwitchFileAndAppendEntriesLocal, SwitchFileAndAppendCommand, reply=%v", reply)
+		return nil, 0, reply
+	}
+	/*endLocal := time.Now()
+	reply = n.ReplicateLog(lastLogIndex, nil, nil, nil, &cmd, extLogCmd)
+	endAll := time.Now()
+	if reply != RaftReplyOk {
+		log.Errorf("Failed: SwitchFileAndAppendEntriesLocal, ReplicateLog, lastLogIndex=%v, replicate=%v, reply=%v", lastLogIndex, endAll.Sub(endLocal), reply)
+		return nil, 0, reply
+	}*/
+
+	//log.Debugf("Success: SwitchFileAndAppendEntriesLocal, lastLogIndex=%v, writeLocal=%v, replicate=%v",
+	//	lastLogIndex, endLocal.Sub(begin), endAll.Sub(endLocal))
+	return ret, lastLogIndex, RaftReplyOk
+}
+
+func (n *RaftInstance) AppendEntriesLocal(rc RaftCommand, extLogCmd ExtLogCommandImpl) (ret interface{}, lastLogIndex uint64, reply int32) {
 	if r := n.IsLeader(); r.reply != RaftReplyOk {
 		return nil, 0, r.reply
 	}
 	//begin := time.Now()
+	cmd := GetAppendEntryCommand(n.currentTerm.Get(), rc)
 	lastLogIndex, reply = n.log.AppendCommand(cmd)
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: AppendEntriesLocal, AppendCommand, reply=%v", reply)
 		return nil, 0, reply
 	}
 	endLocal := time.Now()
-	reply = n.ReplicateLog(lastLogIndex, nil, nil, nil, &cmd)
+	reply = n.ReplicateLog(lastLogIndex, nil, nil, nil, &cmd, extLogCmd)
 	endAll := time.Now()
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: AppendEntriesLocal, ReplicateLog, lastLogIndex=%v, replicate=%v, reply=%v", lastLogIndex, endAll.Sub(endLocal), reply)
@@ -1737,34 +732,44 @@ func (n *RaftInstance) AppendEntriesLocal(cmd AppendEntryCommand) (ret interface
 	return ret, lastLogIndex, RaftReplyOk
 }
 
-func (n *RaftInstance) AppendExtendedLogEntry(extCmdId uint16, m proto.Message) int32 {
+func (n *RaftInstance) __appendExtendedLogEntry(extLogCmd ExtLogCommandImpl, logId LogIdType, switchLogFile bool) int32 {
 	if r := n.IsLeader(); r.reply != RaftReplyOk {
 		return r.reply
 	}
 	begin := time.Now()
-	buf, err := proto.Marshal(m)
+	buf, err := proto.Marshal(extLogCmd.toMsg())
 	if err != nil {
 		log.Errorf("Failed: AppendExtendedLogEntry, Marshal, err=%v", err)
 		return RaftReplyFail
 	}
-	fileId := n.GetExtFileId()
 	marshalTime := time.Now()
-	fileOffset, _, reply := n.files.OpenAndWriteCache(fileId, buf)
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: AppendExtendedLogEntry, OpenAndWriteCache, fileId=%v, reply=%v", fileId, reply)
-		return reply
+	logOffset, err := n.extLogger.AppendSingleBuffer(logId, buf)
+	if err != nil {
+		log.Errorf("Failed: AppendExtendedLogEntry, AppendSingleBuffer, logId=%v, len(buf)=%v, err=%v", logId, len(buf), err)
+		return ErrnoToReply(err)
 	}
-	n.files.dataCache.Put(fileId, fileOffset, buf)
 	writeTime := time.Now()
-	_, _, reply = n.AppendEntriesLocal(NewAppendEntryFileCommand(n.currentTerm.Get(), extCmdId, fileId, fileOffset, buf))
-	appendEntryTime := time.Now()
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: AppendExtendedLogEntry, AppendEntriesLocal, reply=%v", reply)
-		return reply
+	if switchLogFile {
+		_, _, reply := n.SwitchFileAndAppendEntriesLocal(NewExtLogCommandFromExtBuf(extLogCmd.GetExtCmdId(), logId, logOffset, buf), extLogCmd)
+		if reply != RaftReplyOk {
+			log.Errorf("Failed: AppendExtendedLogEntry, SwitchFileAndAppendEntriesLocal, reply=%v", reply)
+			return reply
+		}
+	} else {
+		_, _, reply := n.AppendEntriesLocal(NewExtLogCommandFromExtBuf(extLogCmd.GetExtCmdId(), logId, logOffset, buf), extLogCmd)
+		if reply != RaftReplyOk {
+			log.Errorf("Failed: AppendExtendedLogEntry, AppendEntriesLocal, reply=%v", reply)
+			return reply
+		}
 	}
-	log.Debugf("Success: AppendExtendedLogEntry, fileId=%v, extCmdId=%v, marshalTime=%v, writeTime=%v, appendEntryTime=%v",
-		fileId, extCmdId, marshalTime.Sub(begin), writeTime.Sub(marshalTime), appendEntryTime.Sub(writeTime))
+	appendEntryTime := time.Now()
+	log.Debugf("Success: AppendExtendedLogEntry, logId=%v, extCmdId=%v, marshalTime=%v, writeTime=%v, appendEntryTime=%v",
+		logId, extLogCmd.GetExtCmdId(), marshalTime.Sub(begin), writeTime.Sub(marshalTime), appendEntryTime.Sub(writeTime))
 	return RaftReplyOk
+}
+
+func (n *RaftInstance) AppendExtendedLogEntry(extLogCmd ExtLogCommandImpl) int32 {
+	return n.__appendExtendedLogEntry(extLogCmd, n.GetExtLogId(), false)
 }
 
 // heartBeatOneRound is thread-safe with n.hbLock
@@ -1850,10 +855,10 @@ func (n *RaftInstance) heartBeatOneRound(maxLogIndexPointer *uint64, added *uint
 				log.Errorf("Failed: heartBeatOneRound, LoadCommandAt, logIndex=%v, reply=%v", nextIndex+i, reply)
 				break
 			}
-			optHeaderLength, totalFileLength := cmd.AppendToRpcMsg(&msg)
-			appendedBytes = int(RpcMsgMaxLength) + int(optHeaderLength) + int(totalFileLength)
-			log.Debugf("heartBeatOneRound, prepare: sa=%v, Term=%v, Index=%v, extCmdId=%v, optHeaderLength=%v, totalFileLength=%v",
-				sa, cmd.GetTerm(), nextIndex+i, cmd.GetExtCmdId(), optHeaderLength, totalFileLength)
+			optHeaderLength, totalExtLogLength := cmd.AppendToRpcMsg(&msg)
+			appendedBytes = int(RpcMsgMaxLength) + int(optHeaderLength) + int(totalExtLogLength)
+			log.Debugf("heartBeatOneRound, prepare: sa=%v, Term=%v, Index=%v, extCmdId=%v, optHeaderLength=%v, totalExtLogLength=%v",
+				sa, cmd.GetTerm(), nextIndex+i, cmd.GetExtCmdId(), optHeaderLength, totalExtLogLength)
 		}
 		allBytes += int32(appendedBytes)
 		messages[fd] = msg
@@ -1883,7 +888,7 @@ func (n *RaftInstance) heartBeatOneRound(maxLogIndexPointer *uint64, added *uint
 		}
 		n.lock.RUnlock()
 
-		indices = append(indices, n.log.GetCurrentLogLength()-1)
+		indices = append(indices, logLength-1)
 		sort.Slice(indices, func(i int, j int) bool { return indices[i] < indices[j] })
 		N := indices[len(indices)/2]
 		prevLog, reply := n.log.LoadCommandAt(N)
@@ -1960,7 +965,7 @@ func (n *RaftInstance) RequestVoteRpc(msg RpcMsg, sa common.NodeAddrInet4, fd in
 			goto respond
 		}
 		currentTerm = T
-		votedFor = RaftPersistStateReset
+		votedFor = OnDiskStateReset
 	}
 
 	// 1. Reply false if T < currentTerm (3.3)
@@ -1969,7 +974,7 @@ func (n *RaftInstance) RequestVoteRpc(msg RpcMsg, sa common.NodeAddrInet4, fd in
 		goto respond
 	}
 	// 2. If votedFor is null or candidateId, and candidate's log is at least as up-to-date as receiver's log, grant vote (3.4, 3.6)
-	if ok := IsReset(votedFor) || votedFor == candidateId; ok {
+	if ok := votedFor == OnDiskStateReset || votedFor == candidateId; ok {
 		logLength := n.log.GetCurrentLogLength()
 		lastLog, reply := n.log.LoadCommandAt(logLength - 1)
 		if reply != RaftReplyOk {
@@ -2001,7 +1006,7 @@ func (n *RaftInstance) RequestVoteRpc(msg RpcMsg, sa common.NodeAddrInet4, fd in
 	}
 respond:
 	msg.FillRequestVoteResponseArgs(T, voteGranted, reply)
-	if reply = n.replyClient.ReplyRpcMsg(msg, fd, sa, n.files, n.hbInterval, nil); reply != RaftReplyOk {
+	if reply = n.replyClient.ReplyRpcMsg(msg, fd, sa, n.extLogger, n.hbInterval, nil); reply != RaftReplyOk {
 		log.Errorf("Failed: RequestVoteRpc, ReplyRpcMsg, sa=%v, reply=%v", sa, reply)
 	} else {
 		log.Errorf("Success: RequestVoteRpc, T=%v, votedFor=%v, candidateId=%v, voteGranted=%v", T, votedFor, candidateId, voteGranted)
@@ -2094,12 +1099,13 @@ func (n *RaftInstance) requestVotesAny() bool {
 
 	go n.HeartBeaterThread()
 	// Upon becoming leader, append no-op entry to log (6.2)
-	if _, _, reply2 := n.AppendEntriesLocal(NewAppendEntryNoOpCommandDiskFormat(n.currentTerm.Get())); reply2 != RaftReplyOk {
+
+	if _, _, reply2 := n.AppendEntriesLocal(NewNoOpCommand(), nil); reply2 != RaftReplyOk {
 		log.Warnf("Failed: requestVotesAny, AppendEntriesLocal (NoOp), reply=%v", reply2)
 		return false
 	}
-	n.files.Reset()
-	n.resumeCallback()
+	n.extLogger.Reset()
+	n.resumeCallback(n.nodeServer)
 	log.Debugf("Success: requestVotesAny, became a leader, quorum=%v, numServers=%v", quorum, numServers)
 	return true
 }
@@ -2115,7 +1121,7 @@ func (n *RaftInstance) StartVoting() {
 	}
 	n.lock.Lock()
 	n.state = RaftCandidate
-	n.leaderId = RaftPersistStateReset
+	n.leaderId = OnDiskStateReset
 	atomic.StoreInt64(&n.recvLastHB, time.Now().UnixNano())
 	n.lock.Unlock()
 	n.requestVotesAny()
@@ -2136,12 +1142,12 @@ func (n *RaftInstance) Shutdown() {
 		log.Errorf("Failed: Shutdown, followers are still active, len(n.serverIds)=%v", len(n.serverIds))
 		return
 	}
-	n.CleanExtFile()
+	n.CleanExtLogger()
 	_ = n.rpcClient.Close()
 	n.replyClient.Close()
 	n.rpcServer.Close()
-	n.files.Clear()
-	n.log.Clean()
+	n.extLogger.Clear()
+	n.log.Clear()
 	n.votedFor.Clean()
 	n.currentTerm.Clean()
 }
@@ -2164,8 +1170,8 @@ func (n *RaftInstance) CheckReset() (ok bool) {
 		log.Errorf("Failed: RaftInstance.CheckReset, rpcServer")
 		ok = false
 	}
-	if ok2 := n.files.CheckReset(); !ok2 {
-		log.Errorf("Failed: RaftInstance.CheckReset, files")
+	if ok2 := n.extLogger.CheckReset(); !ok2 {
+		log.Errorf("Failed: RaftInstance.CheckReset, extLogger")
 		ok = false
 	}
 	if ok2 := n.log.CheckReset(); !ok2 {
@@ -2210,8 +1216,8 @@ func (n *RaftInstance) CheckReset() (ok bool) {
 		log.Errorf("Failed: RaftInstance.CheckReset, n.extLock is taken")
 		ok = false
 	} else {
-		if n.extLogFileId.lower != 0 || n.extLogFileId.upper != 0 {
-			log.Errorf("Failed: RaftInstance.CheckReset, n.extLogFileId != 0")
+		if n.extRaftLoggerId.lower != 0 || n.extRaftLoggerId.upper != 0 {
+			log.Errorf("Failed: RaftInstance.CheckReset, n.extRaftLoggerId != 0")
 			ok = false
 		}
 		n.extLock.Unlock()
@@ -2277,7 +1283,7 @@ func (n *RaftInstance) CatchUpLog(sa common.NodeAddrInet4, serverId uint32, time
 	} else {
 		log.Errorf("Failed: CatchUpLog, LoadCommandAt, nextIndex=%v, reply=%v", nextIndex, reply)
 	}
-	updatedNextIndex := n.log.GetCurrentLogLength()
+	updatedNextIndex := logLength
 
 	// collect logs in [nextIndex, updatedNextIndex]. no locks are held.
 	var lastErrReply = RaftReplyOk
@@ -2296,8 +1302,8 @@ func (n *RaftInstance) CatchUpLog(sa common.NodeAddrInet4, serverId uint32, time
 			log.Errorf("Failed: CatchUpLog, LoadCommandAt, logIndex=%v, reply=%v", logIndex, reply)
 			break
 		}
-		extHeaderLength, totalFileLength := cmd.AppendToRpcMsg(&msg)
-		appendedBytes = int(RpcMsgMaxLength) + int(extHeaderLength) + int(totalFileLength)
+		extHeaderLength, totalSize := cmd.AppendToRpcMsg(&msg)
+		appendedBytes = int(RpcMsgMaxLength) + int(extHeaderLength) + int(totalSize)
 		log.Debugf("CatchUpLog, AppendToRpcMsg, sa=%v, Term=%v, Index=%v", sa, cmd.GetTerm(), logIndex)
 	}
 
@@ -2305,7 +1311,7 @@ func (n *RaftInstance) CatchUpLog(sa common.NodeAddrInet4, serverId uint32, time
 		return lastErrReply
 	}
 	n.hbLock.Lock()
-	_, err := n.rpcClient.SendAndWait(msg, sa, n.files, timeout)
+	_, err := n.rpcClient.SendAndWait(msg, sa, n.extLogger, timeout)
 	n.hbLock.Unlock()
 	if err != nil {
 		log.Warnf("Failed: CatchUpLog, SendAndWait, Term=%v, appendedBytes=%v, err=%v", currentTerm, appendedBytes, err)
@@ -2350,13 +1356,14 @@ func (n *RaftInstance) AddServerLocal(sa common.NodeAddrInet4, serverId uint32) 
 	n.lock.RUnlock()
 
 	// 4. Append new configuration entry to log (old configuration plus new Server), commit it using majority of new configuration
-	cmd := NewAppendEntryAddServerCommand(n.currentTerm.Get(), serverId, sa.Addr, uint16(sa.Port))
+	rc := NewAddServerCommand(serverId, sa.Addr, uint16(sa.Port))
+	cmd := GetAppendEntryCommand(n.currentTerm.Get(), rc)
 	lastLogIndex, reply := n.log.AppendCommand(cmd)
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: AddServerLocal, AppendLocalLogFromExt, serverId=%v, reply=%v", serverId, reply)
 		return reply
 	}
-	reply = n.ReplicateLog(lastLogIndex, &serverId, &sa, nil, &cmd)
+	reply = n.ReplicateLog(lastLogIndex, &serverId, &sa, nil, &cmd, nil)
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: AddServerLocal, AppendReplicatedLog, serverId=%v, reply=%v", serverId, reply)
 		return reply
@@ -2368,17 +1375,19 @@ func (n *RaftInstance) AddServerLocal(sa common.NodeAddrInet4, serverId uint32) 
 }
 
 func (n *RaftInstance) WaitPreviousCommits() {
-	if n.log.GetCurrentLogLength() == 0 {
-		return
-	}
-	for n.commitIndex < n.log.GetCurrentLogLength()-1 {
+	for {
+		logLength := n.log.GetCurrentLogLength()
+		if logLength == 0 || logLength <= n.commitIndex+1 {
+			break
+		}
 		n.lock.RUnlock()
 		time.Sleep(n.hbInterval)
 		n.lock.RLock()
 	}
 }
 
-func (n *RaftInstance) AppendInitEntry(cmd AppendEntryCommand) int32 {
+func (n *RaftInstance) AppendInitEntry(rc RaftCommand) int32 {
+	cmd := GetAppendEntryCommand(n.currentTerm.Get(), rc)
 	lastLogIndex, reply := n.log.AppendCommand(cmd)
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: AppendInitEntry, AppendCommand, reply=%v", reply)
@@ -2390,7 +1399,7 @@ func (n *RaftInstance) AppendInitEntry(cmd AppendEntryCommand) int32 {
 		n.commitIndex = lastLogIndex
 	}
 	n.lock.Unlock()
-	_ = n.ApplyAll(&cmd, lastLogIndex)
+	n.ApplyAll(&cmd, lastLogIndex, nil)
 	return RaftReplyOk
 }
 
@@ -2405,32 +1414,24 @@ func (n *RaftInstance) AppendBootstrapLogs(groupId string) int32 {
 		return RaftReplyOk
 	}
 	n.lock.RUnlock()
-	cmd := NewAppendEntryAddServerCommand(n.currentTerm.Get(), n.selfId, n.selfAddr.Addr, uint16(n.selfAddr.Port))
-	if reply := n.AppendInitEntry(cmd); reply != RaftReplyOk {
+	if reply := n.AppendInitEntry(NewAddServerCommand(n.selfId, n.selfAddr.Addr, uint16(n.selfAddr.Port))); reply != RaftReplyOk {
 		log.Errorf("Failed: AppendBootstrapLogs (AddServer), AppendInitEntry, reply=%v", reply)
 		return reply
 	}
-	cmd2 := NewAppendEntryResetExtLogCommand(n.currentTerm.Get(), 100, 1)
-	if reply := n.AppendInitEntry(cmd2); reply != RaftReplyOk {
+	if reply := n.AppendInitEntry(NewResetExtCommand(100, 1)); reply != RaftReplyOk {
 		log.Errorf("Failed: AppendBootstrapLogs (ResetExtLog), AppendInitEntry, reply=%v", reply)
 		return reply
 	}
-	id := n.GenerateCoordinatorId()
-	txId := &common.TxIdMsg{ClientId: id.clientId, SeqNum: id.seqNum, TxSeqNum: 0}
-	node := &common.NodeMsg{NodeId: n.selfId, Addr: make([]byte, 4), Port: int32(n.selfAddr.Port), GroupId: groupId}
-	copy(node.Addr, n.selfAddr.Addr[:])
-	msg := &common.UpdateNodeListMsg{Nodes: &common.MembershipListMsg{}, TxId: txId, IsAdd: true}
-	msg.Nodes.Servers = append(msg.Nodes.Servers, node)
-	if reply := n.AppendExtendedLogEntry(AppendEntryUpdateNodeListLocalCmdId, msg); reply != RaftReplyOk {
-		log.Errorf("Failed: AppendBootstrapLogs, AppendExtendedLogEntry, txId=%v, reply=%v", txId, reply)
+	node := RaftNode{nodeId: n.selfId, addr: n.selfAddr, groupId: groupId}
+	if reply := n.AppendExtendedLogEntry(NewInitNodeListCommand(node)); reply != RaftReplyOk {
+		log.Errorf("Failed: AppendBootstrapLogs, AppendExtendedLogEntry, reply=%v", reply)
 		return reply
 	}
-	log.Debugf("Success: AppendBootstrapLogs, selfId=%v, fileId=%v, nextSeqNum=%v", n.selfId, 100, 1)
+	log.Debugf("Success: AppendBootstrapLogs, selfId=%v, logId=%v, nextSeqNum=%v", n.selfId, 100, 1)
 	return RaftReplyOk
 }
 
-func (n *RaftInstance) ApplyAll(cmd *AppendEntryCommand, logIndex uint64) (currentLogLength uint64) {
-	begin := time.Now()
+func (n *RaftInstance) ApplyAll(cmd *AppendEntryCommand, logIndex uint64, extLogCmd ExtLogCommandImpl) {
 	n.applyCond.L.Lock()
 	for n.lastApplied+1 < logIndex {
 		n.applyCond.Wait()
@@ -2439,41 +1440,47 @@ func (n *RaftInstance) ApplyAll(cmd *AppendEntryCommand, logIndex uint64) (curre
 	n.applyCond.L.Unlock()
 	if bug {
 		log.Warnf("BUG: RaftInstance.ApplyAll, some threads stealed processing commitIndex (%v)", logIndex)
-		return n.log.GetCurrentLogLength()
+		return
 	}
 	// n.lastApplied+1 == logIndex
 
-	applyBegin := time.Now()
-	reply2 := n.applyCallback(cmd)
-	if reply2 != RaftReplyOk {
-		log.Errorf("Failed (ignore): RaftInstance.Apply, Index=%v, reply=%v", logIndex, reply2)
-	} else {
-		log.Debugf("Success: RaftInstance.ApplyAll, Apply, Index=%v, extCmdId=%v, reply=%v, lockTime=%v, applyTime=%v",
-			logIndex, cmd.GetExtCmdId(), reply2, applyBegin.Sub(begin), time.Since(applyBegin))
+	rc, ok := cmd.AsRaftCommand()
+	if !ok {
+		log.Errorf("BUG: command is not implemented, logIndex=%v, cmdId=%v", logIndex, cmd.GetExtCmdId())
+		return
 	}
+	rc.Apply(n.nodeServer, extLogCmd)
+	log.Debugf("Success: RaftInstance.ApplyAll, Apply, Index=%v, extCmdId=%v", logIndex, cmd.GetExtCmdId())
 	n.applyCond.L.Lock()
 	if n.lastApplied < logIndex {
 		n.lastApplied = logIndex
 	}
 	n.applyCond.Broadcast()
 	n.applyCond.L.Unlock()
-	return n.log.GetCurrentLogLength()
 }
 
 func (n *RaftInstance) ReplayAll() int32 {
+	n.replaying = true
 	var index = uint64(0)
-	for ; index < n.log.GetCurrentLogLength(); index++ {
+	logLength := n.log.GetCurrentLogLength()
+	for ; index < logLength; index++ {
 		cmd, reply := n.log.LoadCommandAt(index)
 		if reply != RaftReplyOk {
-			log.Errorf("Failed: ReplayAll, index=%v, reply=%v", index, reply)
+			log.Errorf("Failed: ReplayAll, LoadCommandAt, index=%v, reply=%v", index, reply)
 			return reply
 		}
-		reply = n.applyCallback(&cmd)
-		if reply != RaftReplyOk {
-			log.Errorf("Failed: ReplayAll, applyCallback, index=%v, reply=%v", index, reply)
-			return reply
+		extLogCmd, err := LoadExtBuf(n.extLogger, &cmd)
+		if err != nil {
+			log.Errorf("Failed: ReplayAll, LoadExtBuf, index=%v, err=%v", index, err)
+			return ErrnoToReply(err)
 		}
-		log.Debugf("Success: RaftInstance.ApplyAll, Apply, Index=%v, extCmdId=%v", index, cmd.GetExtCmdId())
+		rc, ok := cmd.AsRaftCommand()
+		if !ok {
+			log.Errorf("BUG: command is not implemented, index=%v, cmdId=%v", index, cmd.GetExtCmdId())
+			return RaftReplyFail
+		}
+		rc.Apply(n.nodeServer, extLogCmd)
+		log.Debugf("Success: ReplayAll, Apply, index=%v, extCmdId=%v", index, cmd.GetExtCmdId())
 	}
 	n.applyCond.L.Lock()
 	if n.lastApplied < index {
@@ -2481,6 +1488,7 @@ func (n *RaftInstance) ReplayAll() int32 {
 	}
 	n.applyCond.Broadcast()
 	n.applyCond.L.Unlock()
+	n.replaying = false
 	return RaftReplyOk
 }
 
@@ -2517,13 +1525,14 @@ func (n *RaftInstance) RemoveServerLocal(serverId uint32) int32 {
 	n.lock.RUnlock()
 
 	// 3. Append new configuration entry to log (old configuration without old Server), commit it using majority of new configuration
-	cmd := NewAppendEntryRemoveServerCommand(n.currentTerm.Get(), serverId)
+	rc := NewRemoveServerCommand(serverId)
+	cmd := GetAppendEntryCommand(n.currentTerm.Get(), rc)
 	lastLogIndex, reply := n.log.AppendCommand(cmd)
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: RemoveServerLocal, AppendCommand, serverId=%v, reply=%v", serverId, reply)
 		return reply
 	}
-	reply = n.ReplicateLog(lastLogIndex, nil, nil, &n.selfId, &cmd)
+	reply = n.ReplicateLog(lastLogIndex, nil, nil, &n.selfId, &cmd, nil)
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: RemoveServerLocal, ReplicateLog, serverId=%v, reply=%v", serverId, reply)
 		return reply
@@ -2558,10 +1567,11 @@ func (n *RaftInstance) RemoveAllServerIds() int32 {
 	cmds := make([]*AppendEntryCommand, 0)
 	nrRemoved := uint64(len(serverIds))
 	for _, serverId := range serverIds {
-		cmd := NewAppendEntryRemoveServerCommand(n.currentTerm.Get(), serverId)
+		rc := NewRemoveServerCommand(serverId)
+		cmd := GetAppendEntryCommand(n.currentTerm.Get(), rc)
 		last, reply := n.log.AppendCommand(cmd)
 		if reply != RaftReplyOk {
-			log.Errorf("Failed: RemoveServerLocal, AppendCommand, serverId=%v, reply=%v", serverId, reply)
+			log.Errorf("Failed: RemoveAllServerIds, AppendCommand, serverId=%v, reply=%v", serverId, reply)
 			return reply
 		}
 		cmds = append(cmds, &cmd)
@@ -2575,7 +1585,7 @@ func (n *RaftInstance) RemoveAllServerIds() int32 {
 	}
 	n.lock.Unlock()
 	for i := uint64(0); i < nrRemoved; i++ {
-		_ = n.ApplyAll(cmds[i], lastLogIndex-nrRemoved+1+i)
+		n.ApplyAll(cmds[i], lastLogIndex-nrRemoved+1+i, nil)
 	}
 	return RaftReplyOk
 }
@@ -2696,12 +1706,12 @@ func NewRaftInstance(server *NodeServer) (*RaftInstance, uint64) {
 	if err := checkState(server.getStateFile(), fmt.Sprintf("%d", server.args.ServerId), server.args.MountPoint); err != nil {
 		return nil, 0
 	}
-	logFile, reply := NewLogFile(dataDir, fmt.Sprintf("%d-raft-", server.args.ServerId))
+	RaftLogger, reply := NewRaftLogger(dataDir, fmt.Sprintf("%d-raft-", server.args.ServerId), 32)
 	if reply != RaftReplyOk {
-		log.Errorf("Failed: NewRaftInstance, NewLogFile, rootDir=%v, reply=%v", dataDir, reply)
+		log.Errorf("Failed: NewRaftInstance, NewRaftLogger, rootDir=%v, reply=%v", dataDir, reply)
 		return nil, 0
 	}
-	logLength := logFile.GetCurrentLogLength() // get logLength here since we want to get this before recording no op at leader election
+	logLength := RaftLogger.GetCurrentLogLength() // get logLength here since we want to get this before recording no op at leader election
 	var externalIp net.IP
 	externalIpStr := server.args.ExternalIp
 	iFName := server.flags.IfName
@@ -2755,19 +1765,19 @@ func NewRaftInstance(server *NodeServer) (*RaftInstance, uint64) {
 	listenSa := common.NodeAddrInet4{Addr: [4]byte{listenIpV4[0], listenIpV4[1], listenIpV4[2], listenIpV4[3]}, Port: server.args.RaftPort}
 
 	selfId := uint32(server.args.ServerId)
-	currentTerm, reply := NewRaftPersistState(logFile.rootDir, selfId, "currentTerm")
+	currentTerm, reply := NewOnDiskState(dataDir, selfId, "currentTerm")
 	if reply != RaftReplyOk {
-		log.Errorf("Failed: NewRaftInstance, NewRaftPersistState, rootDir=%v, selfId=%v, h=currentTerm, reply=%v", logFile.rootDir, selfId, reply)
+		log.Errorf("Failed: NewRaftInstance, NewOnDiskState, dataDir=%v, selfId=%v, h=currentTerm, reply=%v", dataDir, selfId, reply)
 		return nil, 0
 	}
-	if currentTerm.Get() == RaftPersistStateReset {
+	if currentTerm.Get() == OnDiskStateReset {
 		if reply = currentTerm.Set(0); reply != RaftReplyOk {
-			log.Errorf("Failed: NewRaftInstance, NewRaftPersistState, currentTerm.Get, reply=%v", reply)
+			log.Errorf("Failed: NewRaftInstance, NewOnDiskState, currentTerm.Get, reply=%v", reply)
 		}
 	}
-	votedFor, reply := NewRaftPersistState(logFile.rootDir, selfId, "votedFor")
+	votedFor, reply := NewOnDiskState(dataDir, selfId, "votedFor")
 	if reply != RaftReplyOk {
-		log.Errorf("Failed: NewRaftInstance, NewRaftPersistState, rootDir=%v, selfId=%v, h=votedFor, reply=%v", logFile.rootDir, selfId, reply)
+		log.Errorf("Failed: NewRaftInstance, NewOnDiskState, dataDir=%v, selfId=%v, h=votedFor, reply=%v", dataDir, selfId, reply)
 		return nil, 0
 	}
 	rpcServer, err := NewRpcThreads(listenSa, iFName)
@@ -2794,7 +1804,7 @@ func NewRaftInstance(server *NodeServer) (*RaftInstance, uint64) {
 		hbLock:         new(sync.Mutex),
 		selfId:         selfId,
 		selfAddr:       selfSa,
-		leaderId:       RaftPersistStateReset,
+		leaderId:       OnDiskStateReset,
 		state:          RaftInit,
 		recvLastHB:     time.Now().UnixNano(),
 		hbInterval:     server.flags.HeartBeatIntervalDuration,
@@ -2805,18 +1815,19 @@ func NewRaftInstance(server *NodeServer) (*RaftInstance, uint64) {
 		lastApplied:    0,
 		nextIndex:      make(map[uint32]uint64),
 		matchIndex:     make(map[uint32]uint64),
-		log:            logFile,
-		files:          NewRaftFileCache(fmt.Sprintf("%s/%d-ext", logFile.rootDir, selfId), RaftFileCacheLimit),
+		log:            RaftLogger,
+		extLogger:      NewOnDiskLogger(filepath.Join(dataDir, fmt.Sprintf("%d-ext", selfId))),
 		currentTerm:    currentTerm,
 		votedFor:       votedFor,
 		maxHBBytes:     int(server.flags.RpcChunkSizeBytes),
-		resumeCallback: server.ResumeCoordinatorCommit,
-		applyCallback:  server.Apply,
+		resumeCallback: server.txMgr.ResumeTx,
+		nodeServer:     server,
 		rpcClient:      rpcClient,
 		replyClient:    replyClient,
 		rpcServer:      &rpcServer,
 		serverIds:      make(map[uint32]common.NodeAddrInet4),
 		sas:            make(map[common.NodeAddrInet4]uint32),
+		replaying:      false,
 	}
 	if err = rpcServer.Start(2, server, ret); err != nil {
 		replyClient.Close()

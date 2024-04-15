@@ -2,15 +2,14 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
 	"io"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/google/btree"
 	"github.com/takeshi-yoshimura/fuse"
@@ -21,6 +20,7 @@ import (
 type Chunk struct {
 	inodeKey InodeKeyType
 	offset   int64
+	chunkIdx uint32
 
 	workingHead WorkingChunk
 	lock        *sync.RWMutex
@@ -31,22 +31,23 @@ type Chunk struct {
 	accessLinkPrev *Chunk
 }
 
-func CreateNewChunk(inodeKey InodeKeyType, offset int64, files *RaftFiles) *Chunk {
+func CreateNewChunk(inodeKey InodeKeyType, offset int64, chunkIdx uint32) *Chunk {
 	c := &Chunk{
 		inodeKey:    inodeKey,
 		workingHead: WorkingChunk{},
 		lock:        new(sync.RWMutex),
 		fillLock:    new(sync.RWMutex),
 		offset:      offset,
+		chunkIdx:    chunkIdx,
 	}
 	c.workingHead.prevVer = &c.workingHead
 	c.workingHead.nextVer = &c.workingHead
-	log.Debugf("CreateNewChunk, inodeKey=%v, offset=%v", inodeKey, offset)
+	log.Debugf("CreateNewChunk, inodeKey=%v, offset=%v, chunkIdx=%v", inodeKey, offset, chunkIdx)
 	return c
 }
 
-func (c *Chunk) GetFileId() FileIdType {
-	return FileIdType{lower: uint64(c.inodeKey), upper: uint64(c.offset)}
+func (c *Chunk) GetLogId() LogIdType {
+	return LogIdType{lower: uint64(c.inodeKey), upper: c.chunkIdx}
 }
 
 func (c *Chunk) GetWorkingChunk(ver uint32, updateLRU bool) (*WorkingChunk, error) {
@@ -71,13 +72,13 @@ func (c *Chunk) AddWorkingChunk(inodeMgr *InodeMgr, working *WorkingChunk, prev 
 	prev.nextVer.prevVer = working
 	prev.nextVer = working
 	working.chunkPtr.UpdateLRUList()
-	inodeMgr.readCache.Delete(c.GetFileId())
+	inodeMgr.readCache.Delete(c.GetLogId())
 }
 
 func (c *Chunk) Drop(inodeMgr *InodeMgr, raft *RaftInstance) {
-	inodeMgr.readCache.Delete(c.GetFileId())
-	fileId := c.GetFileId()
-	length, err := raft.files.Remove(fileId)
+	inodeMgr.readCache.Delete(c.GetLogId())
+	logId := c.GetLogId()
+	length, err := raft.extLogger.Remove(logId)
 	if err != nil {
 		log.Errorf("Failed: Drop, Remove, err=%v", err)
 		return
@@ -91,7 +92,7 @@ func (c *Chunk) Drop(inodeMgr *InodeMgr, raft *RaftInstance) {
 
 	c.workingHead.prevVer = &c.workingHead
 	c.workingHead.nextVer = &c.workingHead
-	log.Debugf("Success: Chunk.Drop, inodeKey=%v, offset=%v, fileId=%v, length=%v, lastAccess=%v", c.inodeKey, c.offset, fileId, length, c.lastAccess)
+	log.Debugf("Success: Chunk.Drop, inodeKey=%v, offset=%v, logId=%v, length=%v, lastAccess=%v", c.inodeKey, c.offset, logId, length, c.lastAccess)
 }
 
 func (c *Chunk) NewWorkingChunk(chunkVer uint32) *WorkingChunk {
@@ -129,61 +130,33 @@ type StagingChunk struct {
 	slop       int64
 	length     int64
 	updateType byte
-	fileOffset int64
+	logOffset  int64
 	fetchKey   string //used to fetch contents from COS to fill staging chunks at local)
 }
 
-func NewStagingChunk(slop int64, length int64, updateType byte, fileOffset int64, key string, filled int32) *StagingChunk {
+func NewStagingChunk(slop int64, length int64, updateType byte, logOffset int64, key string, filled int32) *StagingChunk {
 	return &StagingChunk{
 		filled:     filled,
 		slop:       slop,
 		length:     length,
 		updateType: updateType,
-		fileOffset: fileOffset,
+		logOffset:  logOffset,
 		fetchKey:   key,
 	}
 }
 
-func alignedRead(buf []byte, fileName string, offset int64, dataLen int64) (int64, error) {
-	begin := time.Now()
-	fd, err := unix.Open(fileName, 0644, unix.O_RDONLY|unix.O_DIRECT)
-	if err != nil {
-		log.Errorf("Failed: alignedRead, Open, fileName=%v, err=%v", fileName, err)
-		return 0, err
-	}
-	if dataLen > int64(len(buf)) {
-		dataLen = int64(len(buf))
-	}
-	var count = int64(0)
-	for count < dataLen {
-		var c int
-		c, err = unix.Pread(fd, buf[count:dataLen], offset+count)
-		if err != nil {
-			log.Errorf("Failed: alignedRead, Pread, fd=%v, count=%v, offset=%v, err=%v", fd, count, offset, err)
-			break
-		}
-		if c == 0 {
-			break
-		}
-		count += int64(c)
-	}
-	if err2 := unix.Close(fd); err2 != nil {
-		log.Errorf("Failed (ignore): alignedRead, Close, fd=%v, fileName=%v, err=%v", fd, fileName, err2)
-	}
-	log.Debugf("Success: alignedRead, fileName=%v, offset=%v, dataLen=%v, count=%v, elapsed=%v", fileName, offset, dataLen, count, time.Since(begin))
-	if count == 0 {
-		return 0, io.EOF
-	}
-	return count, err
+func NewStagingChunkFromAddMsg(msg *common.StagingChunkAddMsg) *StagingChunk {
+	s := NewStagingChunk(msg.GetSlop(), msg.GetLength(), msg.GetUpdateType()[0], msg.GetLogOffset(), msg.GetFetchKey(), msg.GetFilled())
+	return s
 }
 
-func (s *StagingChunk) ReadObject(inodeMgr *InodeMgr, reader *BufferedFilePageReader) (err error) {
+func (s *StagingChunk) ReadObject(inodeMgr *InodeMgr, reader *BufferedDiskPageReader) (err error) {
 	alignedSize := reader.dataLen + reader.alignLeft
 	if alignedSize%int64(SectorSize) != 0 {
 		alignedSize = alignedSize - alignedSize%int64(SectorSize) + int64(SectorSize)
 	}
 	var count int64
-	count, err = alignedRead(reader.buf.Buf, inodeMgr.raft.files.GetFileName(reader.fileId), reader.bufFileOffset, alignedSize)
+	count, err = inodeMgr.raft.extLogger.ReadNoCache(reader.logId, reader.buf.Buf, reader.bufLogOffset, alignedSize, true)
 	if err != nil {
 		return err
 	}
@@ -206,56 +179,23 @@ func (s *StagingChunk) ReadObject(inodeMgr *InodeMgr, reader *BufferedFilePageRe
 	return nil
 }
 
-func (s *StagingChunk) AppendToLog(inodeMgr *InodeMgr, reader *BufferedFilePageReader, fetchKey string) (err error) {
-	fileOffset := reader.bufFileOffset + reader.alignLeft
+func (s *StagingChunk) AppendToLog(inodeMgr *InodeMgr, reader *BufferedDiskPageReader, fetchKey string) (err error) {
+	logOffset := reader.bufLogOffset + reader.alignLeft
 	begin := time.Now()
 	var lastLogIndex uint64
 	var reply int32
 	var write, append time.Time
-	var fd int
 
 	buf := reader.buf.Buf[reader.alignLeft:]
-	bufSlice := (*reflect.SliceHeader)(unsafe.Pointer(&buf))
-	mode := unix.O_WRONLY | unix.O_SYNC | unix.O_CREAT
-	if bufSlice.Data%uintptr(SectorSize) == 0 && fileOffset%int64(SectorSize) == 0 && len(buf)%SectorSize == 0 {
-		mode |= unix.O_DIRECT
-	}
-
 	var skipWrite = false
 	var skipAppend = false
 	for i := 0; ; i++ {
 		if !skipWrite {
-			var count = 0
-			fd, err = inodeMgr.raft.files.Open(reader.fileId, mode)
-			if err != nil {
-				log.Errorf("Failed: StagingChunk.AppendToLog, Open, fileId=%v, err=%v", reader.fileId, err)
+			if err := inodeMgr.raft.extLogger.WriteSingleBuffer(reader.logId, buf, logOffset); err != nil {
+				log.Errorf("Failed: StagingChunk.AppendToLog, WriteSingleBuffer, fetchKey=%v, logId=%v, len(buf)=%v, logOffset=%v, err=%v",
+					fetchKey, reader.logId, len(buf), logOffset, err)
 				goto out
 			}
-			for count < len(buf) {
-				var c int
-				c, err = unix.Pwrite(fd, buf[count:], fileOffset+int64(count))
-				if err != nil {
-					log.Errorf("Failed: StagingChunk.AppendToLog, Pwrite, fetchKey=%v, fileId=%v, fd=%v, buf=%x, count=%v, len(buf)=%v, fileOffset=%v, directIO=%v, err=%v",
-						fetchKey, reader.fileId, fd, bufSlice.Data, count, len(buf), fileOffset, mode&unix.O_DIRECT != 0, err)
-					if err == unix.EINVAL && mode&unix.O_DIRECT != 0 {
-						log.Infof("StagingChunk.AppendToLog, fall back to non-direct I/O")
-						mode = unix.O_WRONLY | unix.O_SYNC | unix.O_CREAT
-					}
-					goto out
-				}
-				count += c
-			}
-			if err = unix.Fsync(fd); err != nil {
-				log.Errorf("Failed: StagingChunk.AppendToLog, Fsync, fd=%v, err=%v", fd, err)
-				goto out
-			}
-			if mode&unix.O_DIRECT == 0 {
-				if err = unix.Fadvise(fd, 0, 0, unix.FADV_DONTNEED); err != nil {
-					log.Errorf("Failed (ignore): StagingChunk.AppendToLog, Fadvise, fileId=%v, fd=%v, offset=%v, length=%v, directIO=%v, err=%v",
-						reader.fileId, fd, fileOffset, len(buf), mode&unix.O_DIRECT != 0, err)
-				}
-			}
-			//inodeMgr.raft.files.AddDiskUsage(int64(count)): this is counted at ReserveRange called by GetChunkOrSetAtRemote
 			skipWrite = true
 			write = time.Now()
 		}
@@ -267,7 +207,8 @@ func (s *StagingChunk) AppendToLog(inodeMgr *InodeMgr, reader *BufferedFilePageR
 					dataLen = int64(inodeMgr.raft.maxHBBytes)
 				}
 				b := buf[offset : offset+dataLen]
-				cmd = NewAppendEntryFileCommand(inodeMgr.raft.currentTerm.Get(), AppendEntryFillChunkCmdId, reader.fileId, 0, b)
+				rc := NewExtLogCommandFromExtBuf(AppendEntryFillChunkCmdId, reader.logId, logOffset, b)
+				cmd := GetAppendEntryCommand(inodeMgr.raft.currentTerm.Get(), rc)
 				lastLogIndex, reply = inodeMgr.raft.log.AppendCommand(cmd)
 				if reply != RaftReplyOk {
 					log.Errorf("Failed: StagingChunk.AppendToLog, AppendCommand, reply=%v", reply)
@@ -277,7 +218,7 @@ func (s *StagingChunk) AppendToLog(inodeMgr *InodeMgr, reader *BufferedFilePageR
 				offset += int64(len(b))
 			}
 			append = time.Now()
-			reply = inodeMgr.raft.ReplicateLog(lastLogIndex, nil, nil, nil, &cmd)
+			reply = inodeMgr.raft.ReplicateLog(lastLogIndex, nil, nil, nil, &cmd, nil)
 			if reply != RaftReplyOk {
 				log.Errorf("Failed: StagingChunk.AppendToLog, ReplicateLog, lastLogIndex=%v, reply=%v", lastLogIndex, reply)
 				err = ReplyToFuseErr(reply)
@@ -286,12 +227,6 @@ func (s *StagingChunk) AppendToLog(inodeMgr *InodeMgr, reader *BufferedFilePageR
 			skipAppend = true
 		}
 	out:
-		if fd > 0 {
-			if err2 := unix.Close(fd); err2 != nil {
-				log.Errorf("Failed (ignore): StagingChunk.AppendToLog, Close, fd=%v, err=%v", fd, err2)
-			}
-			fd = -1
-		}
 		if err != nil {
 			// s.filled remains 0 and with reader inevictable at a failure.
 			// We keep retrying until it succeeds infinitely. Users can still access the buffer since we don't set it evictable.
@@ -302,13 +237,13 @@ func (s *StagingChunk) AppendToLog(inodeMgr *InodeMgr, reader *BufferedFilePageR
 		}
 		atomic.StoreInt32(&s.filled, 1)
 		inodeMgr.readCache.SetEvictable(reader)
-		log.Debugf("Success: StagingChunk.AppendToLog, index=%v, fileId=%v, fileOffset=%v, length=%v, write=%v, append=%v, replicate=%v, elapsed=%v",
-			lastLogIndex, reader.fileId, fileOffset, len(buf), write.Sub(begin), append.Sub(write), time.Since(append), time.Since(begin))
+		log.Debugf("Success: StagingChunk.AppendToLog, index=%v, logId=%v, logOffset=%v, length=%v, write=%v, append=%v, replicate=%v, elapsed=%v",
+			lastLogIndex, reader.logId, logOffset, len(buf), write.Sub(begin), append.Sub(write), time.Since(append), time.Since(begin))
 		return
 	}
 }
 
-func (s *StagingChunk) GetObject(inodeMgr *InodeMgr, reader *BufferedFilePageReader, fetchOffset int64) error {
+func (s *StagingChunk) GetObject(inodeMgr *InodeMgr, reader *BufferedDiskPageReader, fetchOffset int64) error {
 	begin := time.Now()
 	var res *GetBlobOutput
 	var err, awsErr error
@@ -363,8 +298,8 @@ func (s *StagingChunk) GetObject(inodeMgr *InodeMgr, reader *BufferedFilePageRea
 	go s.AppendToLog(inodeMgr, reader, key)
 	c := time.Now()
 	if copied {
-		log.Infof("Success: GetObject, fetchKey=%v, offset=%v, slop=%v, fileOffset=%v, length=%v, get=%v, copy=%v",
-			key, fetchOffset, s.slop, s.fileOffset, s.length, get.Sub(begin), c.Sub(get))
+		log.Infof("Success: GetObject, fetchKey=%v, offset=%v, slop=%v, logOffset=%v, length=%v, get=%v, copy=%v",
+			key, fetchOffset, s.slop, s.logOffset, s.length, get.Sub(begin), c.Sub(get))
 	}
 	return nil
 }
@@ -392,21 +327,21 @@ func (c *WorkingChunk) AddNewStag(raft *RaftInstance, backingKey string, offset 
 	if length > chunkSize {
 		length = chunkSize
 	}
-	fileId := c.chunkPtr.GetFileId()
-	fileOffset := raft.files.ReserveRange(fileId, length)
+	logId := c.chunkPtr.GetLogId()
+	logOffset := raft.extLogger.ReserveRange(logId, length)
 	filled := int32(1)
 	if backingKey != "" {
 		filled = 0
 	}
-	newStag := NewStagingChunk(slop, length, updateType, fileOffset, backingKey, filled)
+	newStag := NewStagingChunk(slop, length, updateType, logOffset, backingKey, filled)
 	c.AddStag(newStag)
-	log.Debugf("AddNewStag, fetchKey=%v, offset=%v, size=%v, chunkSize=%v, fileId=%v, fileOffset=%v, length=%v",
-		backingKey, offset, objectSize, chunkSize, fileId, fileOffset, length)
+	log.Debugf("AddNewStag, fetchKey=%v, offset=%v, size=%v, chunkSize=%v, logId=%v, logOffset=%v, length=%v",
+		backingKey, offset, objectSize, chunkSize, logId, logOffset, length)
 	return RaftReplyOk
 }
 
 func (c *WorkingChunk) AddNewStagFromMsg(l *common.StagingChunkAddMsg) {
-	newStag := NewStagingChunk(l.GetSlop(), l.GetLength(), l.GetUpdateType()[0], l.GetFileOffset(), l.GetFetchKey(), l.GetFilled())
+	newStag := NewStagingChunk(l.GetSlop(), l.GetLength(), l.GetUpdateType()[0], l.GetLogOffset(), l.GetFetchKey(), l.GetFilled())
 	c.AddStag(newStag)
 }
 
@@ -445,8 +380,8 @@ func (c *WorkingChunk) addPartSlowPath(stag *StagingChunk) {
 	if p != nil {
 		pLast := p.LastOffset()
 		if pLast == stag.slop && atomic.LoadInt32(&stag.filled) == 1 &&
-			p.chunk.slop == p.slop && p.chunk.length == p.length && p.chunk.fileOffset+p.length == stag.fileOffset {
-			stag.fileOffset = p.chunk.fileOffset
+			p.chunk.slop == p.slop && p.chunk.length == p.length && p.chunk.logOffset+p.length == stag.logOffset {
+			stag.logOffset = p.chunk.logOffset
 			stag.length += p.length
 			stag.slop = p.slop
 			added = true
@@ -625,9 +560,9 @@ func (c *WorkingChunk) findPart(curSlop int64) *StagingChunkPart {
 
 func (c *WorkingChunk) getSlice(inodeMgr *InodeMgr, ptr *StagingChunkPart, offset int64, blocking bool) (slice SlicedPageBuffer, err error) {
 	stag := ptr.chunk
-	fileId := c.chunkPtr.GetFileId()
+	logId := c.chunkPtr.GetLogId()
 	if blocking {
-		if reader := inodeMgr.readCache.GetCacheWithFillWait(fileId, ptr, offset); reader != nil {
+		if reader := inodeMgr.readCache.GetCacheWithFillWait(logId, ptr, offset); reader != nil {
 			slice, err = reader.GetSlicedPageBufferAt(ptr, offset, inodeMgr.readCache.dec)
 			if err != nil {
 				inodeMgr.readCache.SetEvictable(reader)
@@ -635,7 +570,7 @@ func (c *WorkingChunk) getSlice(inodeMgr *InodeMgr, ptr *StagingChunkPart, offse
 			return
 		}
 	} else {
-		reader, beginFill := inodeMgr.readCache.GetCacheOrBeginFill(fileId, ptr.chunk.fileOffset)
+		reader, beginFill := inodeMgr.readCache.GetCacheOrBeginFill(logId, ptr.chunk.logOffset)
 		if reader != nil { // cache exists
 			slice, err = reader.GetSlicedPageBufferAt(ptr, offset, inodeMgr.readCache.dec)
 			if err != nil {
@@ -649,13 +584,13 @@ func (c *WorkingChunk) getSlice(inodeMgr *InodeMgr, ptr *StagingChunkPart, offse
 		// this thread starts filling (probably give up at next page allocation due to insufficient memory)
 	}
 
-	var reader *BufferedFilePageReader
-	reader, err = inodeMgr.readCache.GetNewBufferedFilePageReader(fileId, stag, blocking)
+	var reader *BufferedDiskPageReader
+	reader, err = inodeMgr.readCache.GetNewBufferedDiskPageReader(logId, stag, blocking)
 	if err != nil {
 		if blocking || (!blocking && err != unix.EAGAIN) {
 			log.Errorf("Failed: WorkingChunk.getSlice, GetPageBuffer, length=%v, err=%v", stag.length, err)
 		}
-		inodeMgr.readCache.EndFill(fileId, stag.fileOffset)
+		inodeMgr.readCache.EndFill(logId, stag.logOffset)
 		return SlicedPageBuffer{}, err
 	}
 	needDownload := atomic.LoadInt32(&stag.filled) == 0
@@ -666,7 +601,7 @@ func (c *WorkingChunk) getSlice(inodeMgr *InodeMgr, ptr *StagingChunkPart, offse
 	}
 	if err != nil {
 		inodeMgr.readCache.ReleaseInFlightBuffer(reader)
-		inodeMgr.readCache.EndFill(fileId, stag.fileOffset)
+		inodeMgr.readCache.EndFill(logId, stag.logOffset)
 		log.Errorf("Failed: WorkingChunk.getSlice, Get/ReadObject, download=%v, bsaeOffset=%v, reply=%v",
 			needDownload, c.chunkPtr.offset, err)
 		return SlicedPageBuffer{}, err
@@ -674,7 +609,7 @@ func (c *WorkingChunk) getSlice(inodeMgr *InodeMgr, ptr *StagingChunkPart, offse
 	slice, err = reader.GetSlicedPageBufferAt(ptr, offset, inodeMgr.readCache.dec)
 	if err != nil {
 		inodeMgr.readCache.ReleaseInFlightBuffer(reader)
-		inodeMgr.readCache.EndFill(fileId, stag.fileOffset)
+		inodeMgr.readCache.EndFill(logId, stag.logOffset)
 	} else {
 		reader.buf.Up()
 		// Note: reader.buf.Buf.refCount = 1 or 2 at this moment.
@@ -745,7 +680,7 @@ func (c *WorkingChunk) ReadNext(inodeMgr *InodeMgr, p []byte, offset int64, bloc
 		}
 		return 0, err
 	}
-	copied := memcpy(p, slice.Buf)
+	copied := copy(p, slice.Buf)
 	slice.SetEvictable()
 	if copied == 0 {
 		return 0, io.EOF
@@ -796,20 +731,20 @@ func (c *WorkingChunk) LastNonDeletedPtr() *StagingChunkPart {
 }
 
 func (c *WorkingChunk) Prefetch(inodeMgr *InodeMgr) {
-	fileId := c.chunkPtr.GetFileId()
+	logId := c.chunkPtr.GetLogId()
 	c.stags.Ascend(func(b btree.Item) bool {
 		stag := b.(*StagingChunkPart).chunk
 		if atomic.LoadInt32(&stag.filled) != 0 {
 			return true
 		}
-		if beginFill := inodeMgr.readCache.TryBeginFill(fileId, stag.fileOffset); !beginFill {
+		if beginFill := inodeMgr.readCache.TryBeginFill(logId, stag.logOffset); !beginFill {
 			// give up immediately if someone else already has filled or been filling the target chunk
 			return true
 		}
-		reader, err := inodeMgr.readCache.GetNewBufferedFilePageReader(fileId, stag, false)
+		reader, err := inodeMgr.readCache.GetNewBufferedDiskPageReader(logId, stag, false)
 		if err != nil {
 			// give up immediately if we have no memory
-			inodeMgr.readCache.EndFill(fileId, stag.fileOffset)
+			inodeMgr.readCache.EndFill(logId, stag.logOffset)
 			if err != unix.EAGAIN {
 				log.Errorf("Failed: Prefetch, GetPageBufferNonBlocking, length=%v, err=%v", stag.length, err)
 			}
@@ -818,7 +753,7 @@ func (c *WorkingChunk) Prefetch(inodeMgr *InodeMgr) {
 		err = stag.GetObject(inodeMgr, reader, c.chunkPtr.offset)
 		if err != nil {
 			inodeMgr.readCache.ReleaseInFlightBuffer(reader)
-			inodeMgr.readCache.EndFill(fileId, stag.fileOffset)
+			inodeMgr.readCache.EndFill(logId, stag.logOffset)
 			log.Errorf("Failed: Prefetch, GetObject, err=%v", err)
 			return false
 		}
@@ -837,7 +772,7 @@ func (c *WorkingChunk) toStagingChunkAddMsg() []*common.StagingChunkAddMsg {
 			Slop:       chunk.slop,
 			Length:     chunk.length,
 			UpdateType: []byte{chunk.updateType},
-			FileOffset: chunk.fileOffset,
+			LogOffset:  chunk.logOffset,
 			FetchKey:   chunk.fetchKey,
 			Filled:     chunk.filled,
 		})
@@ -881,20 +816,20 @@ func (c *Chunk) DeleteFromLRUListNoLock() {
 	c.accessLinkNext = c
 }
 
-func CollectLRUChunks(dirtyMgr *DirtyMgr, raft *RaftInstance, reclaimDiskBytes int64) *common.DropLRUChunksArgs {
+func CollectLRUChunks(dirtyMgr *DirtyMgr, raft *RaftInstance, reclaimDiskBytes int64) (keys []uint64, offsets []int64) {
 	total := int64(0)
-	keys := make([]uint64, 0)
-	offsets := make([]int64, 0)
+	keys = make([]uint64, 0)
+	offsets = make([]int64, 0)
 	AccessLinkLock.Lock()
 	for c := AccessLinkHead.accessLinkPrev; c != &AccessLinkHead && total < reclaimDiskBytes; c = c.accessLinkPrev {
 		if !dirtyMgr.IsDirtyChunk(c) {
-			total += raft.files.GetFileLength(c.GetFileId())
+			total += raft.extLogger.GetSize(c.GetLogId())
 			keys = append(keys, uint64(c.inodeKey))
 			offsets = append(offsets, c.offset)
 		}
 	}
 	AccessLinkLock.Unlock()
-	return &common.DropLRUChunksArgs{InodeKeys: keys, Offsets: offsets}
+	return
 }
 
 func CollectLRUDirtyKeys(dirtyMgr *DirtyMgr, raft *RaftInstance, reclaimDiskBytes int64) (keys map[InodeKeyType]bool) {
@@ -905,8 +840,11 @@ func CollectLRUDirtyKeys(dirtyMgr *DirtyMgr, raft *RaftInstance, reclaimDiskByte
 	for c := AccessLinkHead.accessLinkPrev; c != &AccessLinkHead && total < reclaimDiskBytes; c = c.accessLinkPrev {
 		// TOFIX: regard writes within the last <100ms as on-going writes and ignore them to avoid thrashing
 		if dirtyMgr.IsDirtyChunk(c) && now.Sub(c.lastAccess) > time.Millisecond*100 {
-			total += raft.files.GetFileLength(c.GetFileId())
-			keys[c.inodeKey] = true
+			size := raft.extLogger.GetSize(c.GetLogId())
+			if size > 0 {
+				total += size
+				keys[c.inodeKey] = true
+			}
 		}
 	}
 	AccessLinkLock.Unlock()
@@ -981,7 +919,7 @@ func (r *ChunkReader) Read(p []byte) (int, error) {
 	return int(bufOff), nil
 }
 
-func (r *ChunkReader) GetBufferDirect(size int) (bufs []SlicedPageBuffer, count int, err error) {
+func (r *ChunkReader) GetBufferZeroCopy(size int) (bufs []SlicedPageBuffer, count int, err error) {
 	rOffset := r.offset
 	lastOffset := r.lastOffset
 	if rOffset == lastOffset {
@@ -998,7 +936,7 @@ func (r *ChunkReader) GetBufferDirect(size int) (bufs []SlicedPageBuffer, count 
 				break
 			}
 			if r.blocking || err != unix.EAGAIN {
-				log.Errorf("Failed: ChunkReader.GetBufferDirect, GetNext, rOffset=%v, err=%v", rOffset, err)
+				log.Errorf("Failed: ChunkReader.GetBufferZeroCopy, GetNext, rOffset=%v, err=%v", rOffset, err)
 			}
 			for _, b := range bufs {
 				b.SetEvictable()
@@ -1086,10 +1024,6 @@ func (r *ChunkReader) Seek(offset int64, whence int) (int64, error) {
 	}
 	r.offset = newOff
 	return newOff, nil
-}
-
-func (r *ChunkReader) DontNeed(raft *RaftInstance) {
-	raft.files.DontNeed(r.chunk.chunkPtr.GetFileId())
 }
 
 func (r *ChunkReader) Close() (err error) {

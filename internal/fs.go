@@ -41,7 +41,7 @@ func GetFSWithoutMount(args *common.ObjcacheCmdlineArgs, flags *common.ObjcacheC
 	return fs, nil
 }
 
-func (fs *ObjcacheFileSystem) FuseMount(args *common.ObjcacheCmdlineArgs, flags *common.ObjcacheConfig) (mfs *fuse.MountedFileSystem, err error) {
+func (fs *ObjcacheFileSystem) FuseMount(args *common.ObjcacheCmdlineArgs, flags *common.ObjcacheConfig) (err error) {
 	mountCfg := &fuse.MountConfig{
 		FSName:                  "objcache",
 		Options:                 flags.MountOptions,
@@ -54,13 +54,22 @@ func (fs *ObjcacheFileSystem) FuseMount(args *common.ObjcacheCmdlineArgs, flags 
 		fLog.Level = logrus.DebugLevel
 		mountCfg.DebugLogger = common.GetStdLogger(fLog, logrus.DebugLevel)
 	}
-	fs.SetRoot()
-	var notifier *fuse.Notifier
-	if mfs, notifier, err = fuse.MountAndGetNotifier(args.MountPoint, fuseutil.NewFileSystemServer(fs), mountCfg); err != nil {
+	if err = fs.SetRoot(); err != nil {
+		log.Errorf("Failed: FuseMount, SetRoot, err=%v", err)
+		return err
+	}
+	mfs, notifier, err := fuse.MountAndGetNotifier(args.MountPoint, fuseutil.NewFileSystemServer(fs), mountCfg)
+	if err != nil {
 		log.Errorf("Failed: FuseMount, Mount, err=%v", err)
 		return
 	}
 	fs.notifier = notifier
+	log.Infof("Filesystem is now running.")
+
+	fs.back.WaitShutdown()
+	if err := mfs.Join(context.Background()); err != nil {
+		log.Errorf("Failed: FuseMount, MountedFileSystem.Join, err=%v", err)
+	}
 	return
 }
 
@@ -118,15 +127,15 @@ func (p *ObjcacheProc) CheckReset() (ok bool) {
 }
 
 type LocalInode struct {
-	key            string // name for file, full path for directory
-	version        uint32
-	chunkSize      int64
-	attr           fuseops.InodeAttributes
-	xAttr          map[string][]byte
-	children       map[string]MetaAttributes
-	parentInodeKey InodeKeyType // the first parent since hard links may add parents but this is only used for first fetch from COS.
-	writerCount    *int32
-	storeCount     *int32 // block writer at OpenFile while calling NotifyStore
+	key         string // name for file, full path for directory
+	fetchKey    string // passed to chunk readers
+	version     uint32
+	chunkSize   int64
+	attr        fuseops.InodeAttributes
+	xAttr       map[string][]byte
+	children    map[string]InodeKeyType
+	writerCount *int32
+	storeCount  *int32 // block writer at OpenFile while calling NotifyStore
 }
 
 type StaleInode struct {
@@ -136,7 +145,10 @@ type StaleInode struct {
 }
 
 func (c *LocalInode) toMetaRWHandler(inodeKey InodeKeyType) MetaRWHandler {
-	return MetaRWHandler{inodeKey: inodeKey, version: c.version, size: int64(c.attr.Size), chunkSize: c.chunkSize, mode: uint32(c.attr.Mode), mTime: c.attr.Mtime.UnixNano()}
+	return MetaRWHandler{
+		inodeKey: inodeKey, fetchKey: c.fetchKey,
+		version: c.version, size: int64(c.attr.Size), chunkSize: c.chunkSize, mode: uint32(c.attr.Mode), mTime: c.attr.Mtime.UnixNano(),
+	}
 }
 
 type ObjcacheFileSystem struct {
@@ -188,18 +200,19 @@ func NewObjcacheFileSystem(args *common.ObjcacheCmdlineArgs, flags *common.Objca
 	return fs, nil
 }
 
-func (fs *ObjcacheFileSystem) SetRoot() {
-	parent := MetaAttributes{inodeKey: InodeKeyType(fuseops.RootInodeID), mode: fs.back.flags.DirMode}
-	root, err := fs.back.GetMetaFromClusterOrCOS(InodeKeyType(fuseops.RootInodeID), "", parent)
+func (fs *ObjcacheFileSystem) SetRoot() error {
+	root, children, err := fs.back.GetMeta(InodeKeyType(fuseops.RootInodeID), "", InodeKeyType(fuseops.RootInodeID))
 	if err != nil {
-		log.Fatalf("Failed: SetRoot, GetMetaFromClusterOrCOS, rootId=%v, err=%v", fuseops.RootInodeID, err)
+		log.Errorf("Failed: SetRoot, GetMeta, rootId=%v, err=%v", fuseops.RootInodeID, err)
+		return err
 	}
 	c := int32(0)
 	d := int32(0)
 	fs.inodes[fuseops.RootInodeID] = LocalInode{
-		key: "", version: root.version, chunkSize: root.chunkSize, attr: root.GetAttr(fs.uid, fs.gid),
-		children: root.childAttrs, parentInodeKey: root.parentKey, writerCount: &c, storeCount: &d,
+		key: "", fetchKey: "", version: root.version, chunkSize: root.chunkSize, attr: root.GetAttr(fs.uid, fs.gid),
+		children: children, writerCount: &c, storeCount: &d,
 	}
+	return nil
 }
 
 func (fs *ObjcacheFileSystem) WaitReset() {
@@ -244,10 +257,8 @@ func (fs *ObjcacheFileSystem) prefetchLookUp(parent LocalInode, parentInode fuse
 	child, ok3 := fs.inodes[childInode]
 	fs.lock.RUnlock()
 	key := filepath.Join(parent.key, name)
-	var cmeta *WorkingMeta
-	var err error
-	parentAttr := MetaAttributes{inodeKey: InodeKeyType(parentInode), mode: uint32(parent.attr.Mode)}
-	if cmeta, err = fs.back.GetMetaFromClusterOrCOS(InodeKeyType(childInode), key, parentAttr); err != nil {
+	cmeta, children, err := fs.back.GetMeta(InodeKeyType(childInode), key, InodeKeyType(parentInode))
+	if err != nil {
 		if err == unix.ENOENT {
 			// child may be deleted remotely
 			fs.lock.Lock()
@@ -256,9 +267,6 @@ func (fs *ObjcacheFileSystem) prefetchLookUp(parent LocalInode, parentInode fuse
 			delete(fs.inodes, fuseops.InodeID(childInode))
 			fs.lock.Unlock()
 		}
-		return
-	}
-	if err != nil {
 		return
 	}
 	// see LookUpInode comment
@@ -273,7 +281,7 @@ func (fs *ObjcacheFileSystem) prefetchLookUp(parent LocalInode, parentInode fuse
 			childInode, key, child.version, child.version)
 		return
 	}
-	fs.trackAndUpdateCacheInKernel(key, fuseops.InodeID(childInode), cmeta)
+	fs.trackAndUpdateCacheInKernel(key, fuseops.InodeID(childInode), cmeta, children)
 }
 
 func (fs *ObjcacheFileSystem) readDirInode(inodeId fuseops.InodeID, offset fuseops.DirOffset, dst []byte) (c int, err error) {
@@ -300,12 +308,9 @@ func (fs *ObjcacheFileSystem) readDirInode(inodeId fuseops.InodeID, offset fuseo
 	for j := offset; j < fuseops.DirOffset(len(children)); j++ {
 		name := children[j]
 		child := inode.children[name]
-		e := fuseutil.Dirent{Name: name, Inode: fuseops.InodeID(child.inodeKey), Offset: j + 1, Type: fuseutil.DT_File}
-		if child.IsDir() {
-			e.Type = fuseutil.DT_Directory
-		}
-		if _, ok := fs.inodes[fuseops.InodeID(child.inodeKey)]; !ok {
-			keys[fuseops.InodeID(child.inodeKey)] = name
+		e := fuseutil.Dirent{Name: name, Inode: fuseops.InodeID(child), Offset: j + 1, Type: fuseutil.DT_Unknown}
+		if _, ok := fs.inodes[fuseops.InodeID(child)]; !ok {
+			keys[fuseops.InodeID(child)] = name
 		}
 		n := fuseutil.WriteDirent(dst[c:], e)
 		if n == 0 {
@@ -325,13 +330,6 @@ func (fs *ObjcacheFileSystem) readDirInode(inodeId fuseops.InodeID, offset fuseo
 	return
 }
 
-func (fs *ObjcacheFileSystem) Shutdown() {
-	log.Infof("Attempting to shutdown")
-	if err := fs.Reset(); err == nil {
-		fs.back.Shutdown(true)
-	}
-}
-
 func (fs *ObjcacheFileSystem) StatFS(_ context.Context, op *fuseops.StatFSOp) (err error) {
 	op.BlockSize = uint32(fs.back.flags.ChunkSizeBytes)
 	op.Blocks = 1 * 1024 * 1024 * 1024 * 1024 * 1024 / uint64(op.BlockSize) // 1PB
@@ -343,9 +341,9 @@ func (fs *ObjcacheFileSystem) StatFS(_ context.Context, op *fuseops.StatFSOp) (e
 	return
 }
 
-func (fs *ObjcacheFileSystem) trackAndUpdateCacheInKernel(key string, inodeId fuseops.InodeID, meta *WorkingMeta) bool {
+func (fs *ObjcacheFileSystem) trackAndUpdateCacheInKernel(key string, inodeId fuseops.InodeID, meta *WorkingMeta, children map[string]InodeKeyType) bool {
 	fs.lock.Lock()
-	deleted, needInvalidate := fs.trackCacheInKernel(key, inodeId, meta)
+	deleted, needInvalidate := fs.trackCacheInKernel(key, inodeId, meta, children)
 	fs.lock.Unlock()
 	if !needInvalidate {
 		return needInvalidate
@@ -370,7 +368,7 @@ func (fs *ObjcacheFileSystem) trackAndUpdateCacheInKernel(key string, inodeId fu
 	return needInvalidate
 }
 
-func (fs *ObjcacheFileSystem) trackCacheInKernel(key string, inodeId fuseops.InodeID, meta *WorkingMeta) (deleted map[fuseops.InodeID]string, needInvalidation bool) {
+func (fs *ObjcacheFileSystem) trackCacheInKernel(key string, inodeId fuseops.InodeID, meta *WorkingMeta, children map[string]InodeKeyType) (deleted map[fuseops.InodeID]string, needInvalidation bool) {
 	dent, ok := fs.inodes[inodeId]
 	if ok {
 		if needInvalidation = dent.version != meta.version; !needInvalidation {
@@ -380,29 +378,29 @@ func (fs *ObjcacheFileSystem) trackCacheInKernel(key string, inodeId fuseops.Ino
 	c := int32(0)
 	d := int32(0)
 	inode := LocalInode{
-		version: meta.version, parentInodeKey: meta.parentKey, chunkSize: meta.chunkSize,
+		fetchKey: meta.fetchKey, version: meta.version, chunkSize: meta.chunkSize,
 		attr: meta.GetAttr(fs.uid, fs.gid), xAttr: meta.GetMetadata(), writerCount: &c, storeCount: &d,
 	}
 	if meta.IsDir() {
 		inode.key = key
-		inode.children = make(map[string]MetaAttributes)
+		inode.children = make(map[string]InodeKeyType)
 		inodes := make(map[fuseops.InodeID]bool)
-		for name, child := range meta.childAttrs {
+		for name, child := range children {
 			if ok {
-				if known, ok2 := dent.children[name]; ok2 {
+				if known, ok2 := dent.children[name]; ok2 && known == child {
 					inode.children[name] = known
 					continue
 				}
 			}
-			newInodeId := fuseops.InodeID(child.inodeKey)
+			newInodeId := fuseops.InodeID(child)
 			inode.children[name] = child
 			inodes[newInodeId] = true
 		}
 		if ok {
 			deleted = make(map[fuseops.InodeID]string)
 			for childName, child := range dent.children {
-				if _, ok3 := meta.childAttrs[childName]; !ok3 {
-					childId := fuseops.InodeID(child.inodeKey)
+				if newChild, ok3 := children[childName]; !ok3 || newChild != child {
+					childId := fuseops.InodeID(child)
 					deleted[childId] = childName
 					if _, ok4 := inodes[childId]; !ok4 { // check rename
 						delete(fs.inodes, childId)
@@ -428,22 +426,11 @@ func (fs *ObjcacheFileSystem) updateFileInodeAttr(meta *WorkingMeta) {
 		fs.lock.Unlock()
 		return
 	}
-	parent, ok := fs.inodes[fuseops.InodeID(inode.parentInodeKey)]
-	if !ok {
-		fs.lock.Unlock()
-		return
-	}
 	inode.attr = meta.GetAttr(fs.uid, fs.gid)
 	oldVer := inode.version
 	inode.version = meta.version
 	inode.chunkSize = meta.chunkSize
 	fs.inodes[inodeId] = inode
-	if meta.IsDir() {
-		parent.children[filepath.Base(inode.key)] = meta.toMetaAttr()
-	} else {
-		parent.children[inode.key] = meta.toMetaAttr()
-	}
-	fs.inodes[fuseops.InodeID(inode.parentInodeKey)] = parent
 	fs.lock.Unlock()
 	log.Debugf("Success: updateFileInodeAttr, inodeKey=%v, version=%v->%v", meta.inodeKey, oldVer, inode.version)
 }
@@ -650,28 +637,25 @@ func (fs *ObjcacheFileSystem) LookUpInode(_ context.Context, op *fuseops.LookUpI
 		err = unix.ENOENT
 		return
 	}
-	childAttr, ok2 := parent.children[op.Name]
+	childInode, ok2 := parent.children[op.Name]
 	if !ok2 {
 		fs.lock.RUnlock()
 		return unix.ENOENT
 	}
-	curChildInode, ok3 := fs.inodes[fuseops.InodeID(childAttr.inodeKey)]
+	curChildInode, ok3 := fs.inodes[fuseops.InodeID(childInode)]
 	fs.lock.RUnlock()
 	key := filepath.Join(parent.key, op.Name)
 	var child *WorkingMeta
-	parentAttr := MetaAttributes{inodeKey: InodeKeyType(op.Parent), mode: uint32(parent.attr.Mode)}
-	if child, err = fs.back.GetMetaFromClusterOrCOS(childAttr.inodeKey, key, parentAttr); err != nil {
+	var grandChildren map[string]InodeKeyType
+	if child, grandChildren, err = fs.back.GetMeta(childInode, key, InodeKeyType(op.Parent)); err != nil {
 		if err == unix.ENOENT {
 			// child may be deleted remotely
 			fs.lock.Lock()
 			delete(parent.children, op.Name)
 			fs.inodes[op.Parent] = parent
-			delete(fs.inodes, fuseops.InodeID(childAttr.inodeKey))
+			delete(fs.inodes, fuseops.InodeID(childInode))
 			fs.lock.Unlock()
 		}
-		return
-	}
-	if err != nil {
 		return
 	}
 	// Note: remote nodes may update inodes that is locally cached. We need to invalidate the cache to expose correct views of file attributes and existence.
@@ -687,17 +671,18 @@ func (fs *ObjcacheFileSystem) LookUpInode(_ context.Context, op *fuseops.LookUpI
 		}
 		fs.staleLock.Unlock()
 		log.Warnf("LookUpInode, remote update is detected. the next read will return the content in the local cache (likely stale), inodeKey=%v, key=%v, version=%v->%v",
-			childAttr.inodeKey, key, curChildInode.version, child.version)
-		op.Entry.Child = fuseops.InodeID(childAttr.inodeKey)
+			childInode, key, curChildInode.version, child.version)
+		op.Entry.Child = fuseops.InodeID(childInode)
 		op.Entry.Attributes = curChildInode.attr
 		op.Entry.AttributesExpiration = MaxTime
 		return
 	}
-	fs.trackAndUpdateCacheInKernel(key, fuseops.InodeID(childAttr.inodeKey), child)
-	op.Entry.Child = fuseops.InodeID(childAttr.inodeKey)
+	fs.trackAndUpdateCacheInKernel(key, fuseops.InodeID(childInode), child, grandChildren)
+	op.Entry.Child = fuseops.InodeID(childInode)
 	op.Entry.Attributes = child.GetAttr(fs.uid, fs.gid)
 	op.Entry.AttributesExpiration = MaxTime
 	//op.Entry.EntryExpiration = MaxTime  // ensure the kernel calls LookUpInode everytime a user opens a file/directory.
+	//log.Debugf("LookUpInode, inodeKey=%v, key=%v, version=%v", childAttr.inodeKey, key, child.version)
 	return
 }
 
@@ -782,7 +767,7 @@ func (fs *ObjcacheFileSystem) OpenFile(_ context.Context, op *fuseops.OpenFileOp
 	}
 	op.KeepPageCache = !fs.back.flags.DisableLocalWritebackCaching
 	isReadOnly := op.OpenFlags.IsReadOnly()
-	if !isReadOnly {
+	if !isReadOnly && fs.back.flags.UseNotifyStore {
 		atomic.AddInt32(inode.writerCount, 1)
 		for i := 0; i < 1000*1000; i++ {
 			c := atomic.LoadInt32(inode.storeCount)
@@ -815,16 +800,10 @@ func (fs *ObjcacheFileSystem) ReadFile(_ context.Context, op *fuseops.ReadFileOp
 	}
 	fs.lock.RLock()
 	inode, ok := fs.inodes[fuseops.InodeID(fh.h.inodeKey)]
-	if !ok {
-		fs.lock.RUnlock()
-		return unix.ENOENT
-	}
-	parent, ok2 := fs.inodes[fuseops.InodeID(inode.parentInodeKey)]
-	if !ok2 {
-		fs.lock.RUnlock()
-		return unix.ENOENT
-	}
 	fs.lock.RUnlock()
+	if !ok {
+		return unix.ENOENT
+	}
 	lock := time.Now()
 	/*if op.Dst != nil {
 		op.BytesRead, err = fh.ReadMinimum(filepath.Join(parent.key, inode.key), op.Offset, op.Dst, fs.back)
@@ -844,7 +823,7 @@ func (fs *ObjcacheFileSystem) ReadFile(_ context.Context, op *fuseops.ReadFileOp
 		 */
 		var buffers [][]byte
 		var count int
-		buffers, count, err = fh.Read(filepath.Join(parent.key, inode.key), op.Offset, op.Size+fs.back.flags.ClientReadAheadSizeBytes, fs.back, op)
+		buffers, count, err = fh.Read(op.Offset, op.Size+fs.back.flags.ClientReadAheadSizeBytes, fs.back, op)
 		if err != nil {
 			return
 		}
@@ -914,9 +893,9 @@ func (fs *ObjcacheFileSystem) ReadFile(_ context.Context, op *fuseops.ReadFileOp
 		}
 		log.Debugf("Success: ReadFile (opt), offset=%v, reqSize=%v, BytesRead=%v, notifyStoreSize=%v, elapsed=%v", op.Offset, op.Size, op.BytesRead, readAheadSize, time.Since(begin))
 	} else if fs.back.flags.DisableLocalWritebackCaching {
-		op.Data, op.BytesRead, err = fh.ReadNoCache(filepath.Join(parent.key, inode.key), op.Offset, op.Size, fs.back, op)
+		op.Data, op.BytesRead, err = fh.ReadNoCache(op.Offset, op.Size, fs.back, op)
 	} else {
-		op.Data, op.BytesRead, err = fh.Read(filepath.Join(parent.key, inode.key), op.Offset, op.Size, fs.back, op)
+		op.Data, op.BytesRead, err = fh.Read(op.Offset, op.Size, fs.back, op)
 	}
 	if err == nil {
 		log.Debugf("Success: ReadFile, pid=%v, handle=%v, inode=%v, offset=%v, reqSize=%v, BytesRead=%v, readAheadSize=%v, lock=%v, elapsed=%v", op.OpContext.Pid, op.Handle, op.Inode, op.Offset, op.Size, op.BytesRead, fs.back.flags.ClientReadAheadSizeBytes, lock.Sub(begin), time.Since(begin))
@@ -984,22 +963,32 @@ func (fs *ObjcacheFileSystem) createFileOrDir(parentId fuseops.InodeID, name str
 		err = unix.ENOENT
 		return
 	}
-	inodeKey = fs.back.inodeMgr.CreateInodeId()
-	childAttr := NewMetaAttributes(inodeKey, mode)
-	var meta *WorkingMeta
-	if meta, err = fs.back.CreateObject(parentInode.key, NewMetaAttributes(InodeKeyType(parentId), uint32(parentInode.attr.Mode)), name, childAttr); err != nil {
+	inodeKey, err = fs.back.inodeMgr.CreateInodeId()
+	if err != nil {
+		log.Errorf("Failed: createFileOrDir, CreateInodeId, err=%v", err)
 		return
+	}
+	var meta *WorkingMeta
+	if meta, err = fs.back.CreateObject(parentInode.key, InodeKeyType(parentId), name, inodeKey, mode); err != nil {
+		return
+	}
+	var children map[string]InodeKeyType = nil
+	if meta.IsDir() {
+		children = make(map[string]InodeKeyType)
+		children["."] = inodeKey
+		children[".."] = InodeKeyType(parentId)
 	}
 	fs.lock.Lock()
 	key := filepath.Join(parentInode.key, name)
-	fs.trackCacheInKernel(key, fuseops.InodeID(inodeKey), meta)
+	fs.trackCacheInKernel(key, fuseops.InodeID(inodeKey), meta, children)
 	inode = fs.inodes[fuseops.InodeID(inodeKey)]
-	parentInode.children[name] = meta.toMetaAttr()
+	parentInode.children[name] = meta.inodeKey
 	fs.inodes[parentId] = parentInode
 	fs.lock.Unlock()
 	entry.Child = fuseops.InodeID(inodeKey)
 	entry.Attributes = meta.GetAttr(fs.uid, fs.gid)
 	entry.AttributesExpiration = MaxTime
+	//log.Debugf("createFileOrDir, inodeKey=%v, key=%v, version=%v, parentKey=%v, parentVer=%v,", inodeKey, key, inode.version, parentId, parentInode.version)
 	//entry.EntryExpiration = MaxTime
 	return
 }
@@ -1038,7 +1027,7 @@ func (fs *ObjcacheFileSystem) unlinkFileOrDir(parentInodeId fuseops.InodeID, nam
 	if !ok2 {
 		return unix.ENOENT
 	}
-	if err := fs.back.UnlinkObject(parent.key, parentInodeId, name, child.inodeKey); err != nil {
+	if err := fs.back.UnlinkObject(parent.key, parentInodeId, name, child); err != nil {
 		return err
 	}
 	fs.lock.Lock()
@@ -1063,12 +1052,7 @@ func (fs *ObjcacheFileSystem) SetInodeAttributes(_ context.Context, op *fuseops.
 		err = unix.ENOENT
 		return
 	}
-	parent, ok := fs.inodes[fuseops.InodeID(inode.parentInodeKey)]
 	fs.lock.RUnlock()
-	if !ok {
-		err = unix.ENOENT
-		return
-	}
 
 	var doTruncate = false
 	var fh *FileHandle = nil
@@ -1099,7 +1083,7 @@ func (fs *ObjcacheFileSystem) SetInodeAttributes(_ context.Context, op *fuseops.
 				ts = op.Mtime.UnixNano()
 			}
 			var meta *WorkingMeta
-			meta, err = fs.back.UpdateObjectAttr(MetaAttributes{inodeKey: InodeKeyType(op.Inode), mode: mode}, ts)
+			meta, err = fs.back.UpdateObjectAttr(InodeKeyType(op.Inode), mode, ts)
 			if err != nil {
 				return
 			}
@@ -1114,12 +1098,6 @@ func (fs *ObjcacheFileSystem) SetInodeAttributes(_ context.Context, op *fuseops.
 				fs.lock.Lock()
 				inode.attr = attr
 				fs.inodes[op.Inode] = inode
-				if meta.IsDir() {
-					parent.children[filepath.Base(inode.key)] = meta.toMetaAttr()
-				} else {
-					parent.children[inode.key] = meta.toMetaAttr()
-				}
-				fs.inodes[fuseops.InodeID(inode.parentInodeKey)] = parent
 				fs.lock.Unlock()
 			}
 			op.Attributes = attr
@@ -1151,12 +1129,6 @@ func (fs *ObjcacheFileSystem) SetInodeAttributes(_ context.Context, op *fuseops.
 			}
 		}
 		fs.inodes[op.Inode] = inode
-		if inode.attr.Mode&os.ModeDir != 0 {
-			parent.children[filepath.Base(inode.key)] = NewMetaAttributes(InodeKeyType(op.Inode), uint32(inode.attr.Mode))
-		} else {
-			parent.children[inode.key] = NewMetaAttributes(InodeKeyType(op.Inode), uint32(inode.attr.Mode))
-		}
-		fs.inodes[fuseops.InodeID(inode.parentInodeKey)] = parent
 		fs.lock.Unlock()
 		op.Attributes = inode.attr
 	}
@@ -1204,15 +1176,16 @@ func (fs *ObjcacheFileSystem) Rename(_ context.Context, op *fuseops.RenameOp) (e
 		err = unix.ENOENT
 		return
 	}
-	child, ok2 := parent.children[op.OldName]
+	childKey, ok2 := parent.children[op.OldName]
 	fs.lock.RUnlock()
 	if !ok2 {
-		return unix.ENOENT
+		err = unix.ENOENT
+		return
 	}
-	err = fs.back.RenameObject(parent.key, NewMetaAttributes(InodeKeyType(op.OldParent), uint32(parent.attr.Mode)), newParent.key, op.NewParent, op.OldName, op.NewName, child)
+	err = fs.back.RenameObject(parent.key, InodeKeyType(op.OldParent), newParent.key, op.NewParent, op.OldName, op.NewName, childKey)
 	fs.lock.Lock()
 	delete(parent.children, op.OldName)
-	newParent.children[op.NewName] = child
+	newParent.children[op.NewName] = childKey
 	fs.inodes[op.OldParent] = parent
 	if op.OldParent != op.NewParent {
 		fs.inodes[op.NewParent] = newParent
@@ -1259,21 +1232,10 @@ func (fs *ObjcacheFileSystem) CreateLink(_ context.Context, op *fuseops.CreateLi
 		err = unix.ENOENT
 		return
 	}
-	child, ok2 := inode.children[op.Name]
+	childKey, ok2 := inode.children[op.Name]
 	if !ok2 {
 		fs.lock.RUnlock()
 		err = unix.ENOENT
-		return
-	}
-	_, ok3 := fs.inodes[fuseops.InodeID(child.inodeKey)]
-	if !ok3 {
-		fs.lock.RUnlock()
-		err = unix.ENOENT
-		return
-	}
-	if child.IsDir() {
-		fs.lock.RUnlock()
-		err = unix.EPERM
 		return
 	}
 	dst, ok4 := fs.inodes[op.Target]
@@ -1284,13 +1246,13 @@ func (fs *ObjcacheFileSystem) CreateLink(_ context.Context, op *fuseops.CreateLi
 	}
 	fs.lock.RUnlock()
 	var meta *WorkingMeta
-	if meta, err = fs.back.HardLinkObject(op.Parent, NewMetaAttributes(InodeKeyType(op.Parent), uint32(inode.attr.Mode)), dst.key, op.Target, op.Name, child); err != nil {
+	if meta, err = fs.back.HardLinkObject(op.Parent, InodeKeyType(op.Parent), dst.key, op.Target, op.Name, childKey); err != nil {
 		return
 	}
 	fs.lock.Lock()
-	dst.children[op.Name] = child
+	dst.children[op.Name] = childKey
 	fs.lock.Unlock()
-	op.Entry.Child = fuseops.InodeID(child.inodeKey)
+	op.Entry.Child = fuseops.InodeID(childKey)
 	op.Entry.Attributes = meta.GetAttr(fs.uid, fs.gid)
 	op.Entry.AttributesExpiration = MaxTime
 	//entry.EntryExpiration = MaxTime
@@ -1347,9 +1309,11 @@ func (fs *ObjcacheFileSystem) InitNodeListAsClient() (err error) {
 }
 
 func (fs *ObjcacheFileSystem) Destroy() {
+	unix.Kill(unix.Getpid(), unix.SIGTERM)
+	log.Debugf("ObjcacheFileSystem.Destroy, send SIGTERM to self")
 }
 
-func (fs *ObjcacheFileSystem) Reset() error {
+func (fs *ObjcacheFileSystem) Reset(shutdown bool) error {
 	fs.resetCond.L.Lock()
 	if fs.isResetting > 0 {
 		fs.resetCond.L.Unlock()
@@ -1375,9 +1339,13 @@ func (fs *ObjcacheFileSystem) Reset() error {
 	}
 	fs.lock.Lock()
 	fs.inodes = make(map[fuseops.InodeID]LocalInode, 0)
-	fs.SetRoot()
+	if !shutdown {
+		if err := fs.SetRoot(); err != nil {
+			return err
+		}
+	}
 	fs.lock.Unlock()
-	// caller must call fs.EndReset() to resume filesystem
+	// caller must call fs.EndReset() to resume FS
 	return nil
 }
 

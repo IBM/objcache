@@ -2,6 +2,7 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
@@ -13,8 +14,10 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/signal"
 	"runtime"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -35,12 +38,16 @@ import (
 const TrackerNodeKey = InodeKeyType(math.MaxUint64)
 
 type NodeServer struct {
-	args      *common.ObjcacheCmdlineArgs
-	flags     *common.ObjcacheConfig
-	restarted bool
-	shutdown  int32
+	args       *common.ObjcacheCmdlineArgs
+	flags      *common.ObjcacheConfig
+	restarted  bool
+	shutdown   int32
+	signalChan chan os.Signal
 
-	selfNode RaftNode
+	selfNode   RaftNode
+	nodeCond   *sync.Cond
+	suspending int
+	runOps     int
 
 	inodeMgr     *InodeMgr
 	raft         *RaftInstance
@@ -60,23 +67,25 @@ type NodeServer struct {
 	api.UnimplementedObjcacheApiServer
 }
 
-var serverInstance *NodeServer = nil
-
 /******************************
  * Methods to initialize a Node
  ******************************/
 
-func (n *NodeServer) StartGrpcServer() {
+func (n *NodeServer) StartGrpcServer() error {
 	listenAddr := fmt.Sprintf("%s:%d", n.args.ListenIp, n.args.ApiPort)
 	lis, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("Failed to listen %v: %v", listenAddr, err)
+		log.Errorf("Failed: StartGrpcServer, Listen, listenAddr=%v, err=%v", listenAddr, err)
+		return err
 	}
 	n.s = grpc.NewServer()
 	api.RegisterObjcacheApiServer(n.s, n)
-	if err = n.s.Serve(lis); err != nil {
-		log.Fatalf("Failed to serve at %v: %v", listenAddr, err)
-	}
+	go func() {
+		if err2 := n.s.Serve(lis); err2 != nil {
+			log.Fatalf("Failed: StartGrpcServer, Serve, listenAddr=%v, err=%v", listenAddr, err2)
+		}
+	}()
+	return err
 }
 
 func ProfilerThread(blockProfileRate int, mutexProfileRate int, listenIp string, profilePort int) {
@@ -85,53 +94,87 @@ func ProfilerThread(blockProfileRate int, mutexProfileRate int, listenIp string,
 	common.StdouterrLogger.Println(http.ListenAndServe(fmt.Sprintf("%s:%d", listenIp, profilePort), nil))
 }
 
+var SectorSize = 512
+
 func NewNodeServer(back *ObjCacheBackend, args *common.ObjcacheCmdlineArgs, flags *common.ObjcacheConfig) *NodeServer {
-	if serverInstance != nil {
-		return serverInstance
-	}
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, unix.SIGTERM, unix.SIGINT)
 	if args.ProfilePort > 0 {
 		go ProfilerThread(flags.BlockProfileRate, flags.MutexProfileRate, args.ListenIp, args.ProfilePort)
 	}
 	if args.ClientMode {
-		args.ServerId = uint(math.MaxUint) - 1 // math.MaxUint is used for invalid Id in raft logic. so, decrement it for fake client ID
 		args.RaftGroupId = "client"
 	}
-	server := NodeServer{args: args, flags: flags}
-	server.Init(back)
+
+	SectorSize = int(PageSize) // difficult to get precise size (using df --output=source . and /sys/block/*/queue/hw_sector is too simple for LVM setting)
+
+	server := NodeServer{args: args, flags: flags, signalChan: signalChan}
+	if err := server.Init(back); err != nil {
+		return nil
+	}
 	return &server
 }
 
-var SectorSize = 512
+func (n *NodeServer) WaitShutdown() {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		for {
+			recv := <-n.signalChan
+			if recv == unix.SIGTERM {
+				if n.fs != nil {
+					log.Infof("Received %v, attempting to unmount...", recv)
+					if err := n.fs.Reset(true); err != nil {
+						log.Warnf("Failed: WaitShutdown, fs.Reset, err=%v", err)
+					}
+					fuse.Unmount(n.args.MountPoint)
+				}
+				n.Shutdown(true)
+				break
+			} else {
+				log.Debugf("Ignore signal, recv=%v", recv)
+			}
+		}
+		wg.Done()
+	}()
+	wg.Wait()
+	signal.Reset(unix.SIGTERM)
+}
 
-func (n *NodeServer) Init(back *ObjCacheBackend) {
+func (n *NodeServer) Init(back *ObjCacheBackend) error {
 	InitMemoryPool()
 	InitAccessLinkHead()
-
-	SectorSize = int(PageSize) // difficult to get precise size (using df --output=source . and /sys/block/*/queue/hw_sector is too simple for LVM setting)
 
 	n.remoteCache = NewRemotePageBufferCache(n.flags.RemoteCacheSizeBytes)
 	n.localHistory = NewLocalBufferCacheHistory()
 	rpcClient, err := NewRpcClientV2(n.flags.IfName)
 	if err != nil {
-		log.Fatalf("Failed: NodeServer.Init, NewRpcClientV2, err=%v", err)
+		log.Errorf("Failed: NodeServer.Init, NewRpcClientV2, err=%v", err)
+		return err
 	}
 	replyClient, err := NewRpcReplyClient()
 	if err != nil {
-		log.Fatalf("Failed: NodeServer.Init, NewRpcReplyClient, err=%v", err)
+		log.Errorf("Failed: NodeServer.Init, NewRpcReplyClient, err=%v", err)
+		return err
 	}
 	n.rpcClient = rpcClient
 	n.replyClient = replyClient
+	n.raftGroup = NewRaftGroupMgr(n.args.RaftGroupId, 1)
+	n.txMgr = NewTxMgr()
+	n.dirtyMgr = NewDirtyMgr()
+
 	var logLength uint64
 	n.raft, logLength = NewRaftInstance(n)
 	if n.raft == nil {
-		log.Fatal("Failed: NodeServer.Init, NewRaftInstance")
+		log.Error("Failed: NodeServer.Init, NewRaftInstance")
+		return unix.EINVAL
 	}
-	n.raftGroup = NewRaftGroupMgr(n.args.RaftGroupId, 1)
-	n.txMgr = NewTxMgr()
-	n.rpcMgr = NewRpcManager(n)
 	n.selfNode = RaftNode{nodeId: n.raft.selfId, addr: n.raft.selfAddr, groupId: n.raftGroup.selfGroup}
+	n.nodeCond = sync.NewCond(new(sync.Mutex))
+	n.suspending = 0
+	n.runOps = 0
+	n.rpcMgr = NewRpcManager(n)
 	n.inodeMgr = NewInodeMgr(back, n.raft, n.flags)
-	n.dirtyMgr = NewDirtyMgr()
 	n.raft.Init(n.args.PassiveRaftInit)
 	n.restarted = logLength > 1
 
@@ -140,30 +183,33 @@ func (n *NodeServer) Init(back *ObjCacheBackend) {
 			if !n.args.PassiveRaftInit {
 				log.Infof("NodeServer.Init, this is the very first initialization.")
 				if reply := n.raft.AppendBootstrapLogs(n.raftGroup.selfGroup); reply != RaftReplyOk {
-					log.Fatalf("Failed: NodeServer.Init, AppendBootstrapLogs, reply=%v", reply)
+					log.Errorf("Failed: NodeServer.Init, AppendBootstrapLogs, reply=%v", reply)
+					return ReplyToFuseErr(reply)
 				}
 			}
 		} else {
 			log.Infof("NodeServer.Init, log is detected at disk. restart from Index=%v", logLength-1)
 			if reply := n.raft.ReplayAll(); reply != RaftReplyOk {
-				log.Fatalf("Failed: NodeServer.Init, ReplayAll, reply=%v", reply)
+				log.Errorf("Failed: NodeServer.Init, ReplayAll, reply=%v", reply)
+				return ReplyToFuseErr(reply)
 			}
 		}
 		cacheCapacityBytes, err := resource.ParseQuantity(n.args.CacheCapacity)
 		if err != nil {
-			log.Fatalf("Failed: NodeServer.Init, FromHumanSize, CacheCapacity=%v, err=%v", n.args.CacheCapacity, err)
+			log.Errorf("Failed: NodeServer.Init, FromHumanSize, CacheCapacity=%v, err=%v", n.args.CacheCapacity, err)
+			return err
 		}
-		serverInstance = n
 		go n.FlusherThread()
 		go n.EvictionThread(cacheCapacityBytes.Value())
-	} else {
-		serverInstance = n
 	}
-	go n.StartGrpcServer()
+	if err := n.StartGrpcServer(); err != nil {
+		return err
+	}
 	maxCpus := runtime.NumCPU()
 	maxProcesses := runtime.GOMAXPROCS(0)
 	log.Infof("Success: NodeServer.Init, addr=%v, maxCpus=%v, GOMAXPROCS=%v", n.selfNode, maxCpus, maxProcesses)
 	n.shutdown = 0
+	return nil
 }
 
 func (n *NodeServer) SetFs(fs *ObjcacheFileSystem) {
@@ -171,7 +217,7 @@ func (n *NodeServer) SetFs(fs *ObjcacheFileSystem) {
 }
 
 func (n *NodeServer) IsReady(_ context.Context, _ *api.Void) (*api.ApiRet, error) {
-	if serverInstance == nil {
+	if n == nil {
 		return &api.ApiRet{Status: RaftReplyRetry}, nil
 	}
 	return &api.ApiRet{Status: RaftReplyOk}, nil
@@ -185,305 +231,92 @@ func (n *NodeServer) getStateFile() string {
 	return n.args.RootDir + "/state"
 }
 
-/*******************************************
- * methods to read meta
- * files/inodes can be on the cluster or COS
- *******************************************/
+/*****************************************************************
+ * methods to block all the operations during migration/compaction
+ *****************************************************************/
 
-func (n *NodeServer) GetMetaRpc(msg RpcMsg) *common.GetWorkingMetaRet {
-	args := &common.GetMetaAnyArgs{}
-	if reply := msg.ParseExecProtoBufMessage(args); reply != RaftReplyOk {
-		log.Errorf("Failed: GetMetaRpc, ParseExecProtoBufMessage, reply=%v", reply)
-		return &common.GetWorkingMetaRet{Status: reply}
+func (n *NodeServer) TryBeginOp() bool {
+	n.nodeCond.L.Lock()
+	ret := n.suspending == 0
+	if ret {
+		n.runOps += 1
 	}
-	r := n.raftGroup.BeginRaftRead(n.raft, args.GetNodeListVer())
-	ret := &common.GetWorkingMetaRet{Status: r.reply, Leader: r.GetLeaderNodeMsg()}
-	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: GetMetaRpc, BeginRaftRead, r=%v", r)
-		return ret
-	}
-	parent := MetaAttributes{inodeKey: InodeKeyType(args.GetParentInodeKey()), mode: args.GetParentMode()}
-	meta, reply := n.inodeMgr.GetOrFetchWorkingMeta(InodeKeyType(args.GetInodeKey()), args.GetKey(), args.GetChunkSize(), args.GetExpireMs(), parent)
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: GetMetaRpc, getMetaLocal, name=%v, reply=%v", args.GetKey(), reply)
-		ret.Status = reply
-		return ret
-	}
-	ret.Meta = meta.toMsg()
+	n.nodeCond.L.Unlock()
 	return ret
 }
 
-func (n *NodeServer) getMetaRemote(nodeList *RaftNodeList, node RaftNode, inodeKey InodeKeyType, key string, chunkSize int64, expireMs int32, parent MetaAttributes) (meta *WorkingMeta, r RaftBasicReply) {
-	args := &common.GetMetaAnyArgs{
-		InodeKey: uint64(inodeKey), Key: key, ChunkSize: chunkSize, ExpireMs: expireMs,
-		ParentInodeKey: uint64(parent.inodeKey), ParentMode: parent.mode, NodeListVer: nodeList.version,
+func (n *NodeServer) EndOp() {
+	n.nodeCond.L.Lock()
+	n.runOps -= 1
+	if n.runOps < 0 {
+		log.Warnf("BUG: EndOp, runOps (%v) < 0", n.runOps)
 	}
-	res := &common.GetWorkingMetaRet{}
-	r.reply = n.rpcClient.CallObjcacheRpc(RpcGetMetaCmdId, args, node.addr, time.Duration(0), n.raft.files, nil, nil, res)
+	n.nodeCond.Broadcast()
+	n.nodeCond.L.Unlock()
+}
+
+func (n *NodeServer) LockNode() {
+	n.nodeCond.L.Lock()
+	for n.suspending > 0 || n.runOps > 0 {
+		n.nodeCond.Wait()
+	}
+	n.suspending += 1
+	n.nodeCond.L.Unlock()
+}
+
+func (n *NodeServer) TryLockNode() bool {
+	n.nodeCond.L.Lock()
+	ret := n.suspending == 0 && n.runOps == 0
+	if ret {
+		n.suspending += 1
+	}
+	n.nodeCond.L.Unlock()
+	return ret
+}
+
+func (n *NodeServer) UnlockNode() {
+	n.nodeCond.L.Lock()
+	old := n.suspending
+	n.suspending = old - 1
+	n.nodeCond.Broadcast()
+	n.nodeCond.L.Unlock()
+}
+
+func (n *NodeServer) WaitNodeUnlocked() {
+	n.nodeCond.L.Lock()
+	for n.suspending > 0 || n.runOps > 0 {
+		n.nodeCond.Wait()
+	}
+	n.nodeCond.L.Unlock()
+}
+
+/*******************************************
+ * methods to read inodes
+ *******************************************/
+
+func (n *NodeServer) GetMeta(inodeKey InodeKeyType, key string, parent InodeKeyType) (*WorkingMeta, map[string]InodeKeyType, error) {
+	ret, r := n.rpcMgr.CallRpc(NewGetMetaOp(inodeKey, key, n.flags.ChunkSizeBytes, n.flags.DirtyExpireIntervalMs, parent).GetCaller(n))
 	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: getMetaRemote, CallObjcacheRpc, Node=%v, name=%v, reply=%v", node, key, r.reply)
-		return
+		log.Errorf("Failed: GetMeta, inodeKey=%v, key=%v, reply=%v", inodeKey, key, r.reply)
+		return nil, nil, ReplyToFuseErr(r.reply)
 	}
-	r = NewRaftBasicReply(res.GetStatus(), res.GetLeader())
+	ret2 := ret.ext.(*GetWorkingMetaRet)
+	return ret2.meta, ret2.children, nil
+}
+
+func (n *NodeServer) ReadChunk(h MetaRWHandler, offset int64, size int, blocking bool) (bufs []SlicedPageBuffer, count int, err error) {
+	if h.size == 0 {
+		return nil, 0, nil
+	}
+	ret, r := n.rpcMgr.CallRpc(NewReadChunkOp(h, offset, size, blocking, false).GetCaller(n))
 	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: getMetaRemote, Node=%v, name=%v, reply=%v", node, key, r)
-		return
+		return nil, 0, ReplyToFuseErr(r.reply)
 	}
-	return NewWorkingMetaFromMsg(res.GetMeta()), r
+	ret2 := ret.ext.(ReadChunkOpRet)
+	return ret2.bufs, ret2.count, nil
 }
 
-func (n *NodeServer) GetMetaFromClusterOrCOS(inodeKey InodeKeyType, key string, parent MetaAttributes) (*WorkingMeta, error) {
-	var nodeList *RaftNodeList
-	var leader RaftNode
-	var meta *WorkingMeta
-	for i := 0; i < n.flags.MaxRetry; i++ {
-		l := n.raftGroup.GetNodeListLocal()
-		if nodeList == nil || nodeList.version != l.version {
-			var reply int32
-			leader, nodeList, reply = n.raftGroup.getMetaOwnerNodeLocal(inodeKey)
-			if reply != RaftReplyOk {
-				log.Errorf("Failed: GetMetaFromClusterOrCOS, getMetaOwnerNodeLocal, not found, inodeKey=%v, nodeListVer=%v, reply=%v", inodeKey, nodeList.version, reply)
-				return nil, ReplyToFuseErr(reply)
-			}
-		} else {
-			nodeList = l
-		}
-		var r RaftBasicReply
-		if leader.nodeId == n.raft.selfId {
-			r = n.raftGroup.BeginRaftRead(n.raft, nodeList.version)
-			if r.reply == RaftReplyOk {
-				meta, r.reply = n.inodeMgr.GetOrFetchWorkingMeta(inodeKey, key, n.flags.ChunkSizeBytes, n.flags.DirtyExpireIntervalMs, parent)
-			}
-		} else {
-			meta, r = n.getMetaRemote(nodeList, leader, inodeKey, key, n.flags.ChunkSizeBytes, n.flags.DirtyExpireIntervalMs, parent)
-		}
-		if r.reply != RaftReplyOk || meta == nil {
-			log.Infof("Failed: GetMetaFromClusterOrCOS, Node=%v, key=%v, reply=%v", leader, key, r.reply)
-			if r.reply != RaftReplyOk {
-				if newLeader, found := fixupRpcErr(n, leader, r); found {
-					leader = newLeader
-				}
-			}
-			if needRetry(r.reply) {
-				continue
-			}
-			return nil, ReplyToFuseErr(r.reply)
-		} else if i > 0 {
-			n.raftGroup.UpdateLeader(leader)
-		}
-		log.Debugf("Success: GetMetaFromClusterOrCOS, meta=%v", *meta)
-		break
-	}
-	if meta == nil {
-		log.Errorf("Failed: GetMetaFromClusterOrCOS, getLatestWorkingMetaAny does not progress, key=%v", key)
-		return nil, unix.ETIMEDOUT
-	}
-	return meta, nil
-}
-
-/************************
- * methods to read chunks
- ************************/
-
-func (n *NodeServer) DownloadChunkViaRemote(msg RpcMsg) (*common.DownloadChunkRet, []SlicedPageBuffer) {
-	begin := time.Now()
-	r := n.raft.SyncBeforeClientQuery()
-	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: DownloadChunkViaRemote, SyncBeforeClientQuery, r=%v", r)
-		return &common.DownloadChunkRet{Status: r.reply, Leader: r.GetLeaderNodeMsg()}, nil
-	}
-	raft_sync := time.Now()
-	args := &common.DownloadChunkArgs{}
-	if reply := msg.ParseExecProtoBufMessage(args); reply != RaftReplyOk {
-		log.Errorf("Failed: DownloadChunkViaRemote, ParseExecProtoBufMessage, reply=%v", reply)
-		return &common.DownloadChunkRet{Status: reply, Leader: r.GetLeaderNodeMsg()}, nil
-	}
-	deserialize := time.Now()
-	h := NewMetaRWHandlerFromMsg(args.GetHandler())
-	length := args.GetLength()
-	bufs, count, reply := n.inodeMgr.VectorReadChunk(h, args.GetKey(), args.GetOffset(), int(length), true)
-	if reply != RaftReplyOk {
-		return &common.DownloadChunkRet{Status: reply, Leader: r.GetLeaderNodeMsg(), Count: 0}, nil
-	}
-	endAll := time.Now()
-	log.Debugf("Success: DownloadChunkViaRemote, h=%v, offset=%v, len=%v, count=%v, sync=%v, deser=%v, read=%v",
-		h, args.GetOffset(), args.GetLength(), count, raft_sync.Sub(begin), deserialize.Sub(raft_sync), endAll.Sub(deserialize))
-	return &common.DownloadChunkRet{Status: RaftReplyOk, Leader: r.GetLeaderNodeMsg(), Count: int32(count)}, bufs
-}
-
-func CalculateBufferLengthForDownload(h MetaRWHandler, offset int64) int {
-	length := h.size - offset
-	remaining := h.chunkSize - offset%h.chunkSize
-	if length > remaining {
-		length = remaining
-	}
-	if length > int64(math.MaxInt64) {
-		length = math.MaxInt32
-	}
-	return int(length)
-}
-
-func (n *NodeServer) readChunkRemoteNoCache(node RaftNode, h MetaRWHandler, key string, offset int64, size int, blocking bool) (SlicedPageBuffer, int, RaftBasicReply) {
-	begin := time.Now()
-	length := int64(CalculateBufferLengthForDownload(h, offset))
-	if int(length) > size {
-		length = int64(size)
-	}
-	alignedSize := length
-	if length%PageSize != 0 {
-		alignedSize = length - length%PageSize + PageSize
-	}
-	remoteBuf, err := GetPageBuffer(alignedSize)
-	if err != nil {
-		log.Errorf("Failed: readChunkRemoteNoCache, GetPageBuffer, chunkSize=%v, err=%v", h.chunkSize, err)
-		return SlicedPageBuffer{}, 0, RaftBasicReply{reply: ErrnoToReply(err)}
-	}
-	var r = RaftBasicReply{reply: RaftReplyOk}
-	var c = 0
-	var rpcTime time.Duration
-	for c < int(length) {
-		args := &common.DownloadChunkArgs{
-			Handler: h.toMsg(), Key: key, Offset: offset + int64(c), Length: int32(int(length) - c),
-		}
-		msg := &common.DownloadChunkRet{}
-		rpcArgs := &RpcSeqNumArgs{data: remoteBuf.Buf[c:length]}
-		rpcBegin := time.Now()
-		r.reply = n.rpcClient.CallObjcacheRpc(RpcDownloadChunkViaRemoteCmdId, args, node.addr, time.Duration(0), n.raft.files, nil, rpcArgs, msg)
-		rpcTime += time.Since(rpcBegin)
-		if r.reply != RaftReplyOk {
-			ReturnPageBuffer(remoteBuf)
-			log.Errorf("Failed: readChunkRemoteNoCache, CallObjcacheRpc, Node=%v, meta=%v, offset=%v, reply=%v", node, h, offset, r.reply)
-			return SlicedPageBuffer{}, 0, r
-		}
-		r = NewRaftBasicReply(msg.GetStatus(), msg.GetLeader())
-		if r.reply != RaftReplyOk {
-			ReturnPageBuffer(remoteBuf)
-			log.Errorf("Failed: readChunkRemoteNoCache, CallObjcacheRpc, Node=%v, meta=%v, offset=%v, reply=%v", node, h, offset, r.reply)
-			return SlicedPageBuffer{}, 0, r
-		}
-		c += int(msg.GetCount())
-	}
-	remoteBuf.Buf = remoteBuf.Buf[:c]
-	remoteBuf.Up()
-	slice := remoteBuf.AsSlice()
-	log.Debugf("Success: readChunkRemoteNoCache, node=%v, h=%v, offset=%v, len=%v, count=%v, rpcTime=%v, elapsed=%v", node, h, offset, length, c, rpcTime, time.Since(begin))
-	return slice, c, r
-}
-
-func (n *NodeServer) readChunkRemote(node RaftNode, h MetaRWHandler, key string, offset int64, size int, blocking bool) (SlicedPageBuffer, int, RaftBasicReply) {
-	if n.flags.DisableLocalWritebackCaching {
-		return n.readChunkRemoteNoCache(node, h, key, offset, size, blocking)
-	}
-	begin := time.Now()
-	length := CalculateBufferLengthForDownload(h, offset)
-	if blocking {
-		if slice, ok := n.remoteCache.GetCacheWithFillWait(h.inodeKey, offset, length); ok {
-			log.Debugf("Success: readChunkRemote (cached), h=%v, offset=%v, size=%v", h, offset, size)
-			return slice, len(slice.Buf), RaftBasicReply{reply: RaftReplyOk}
-		}
-	} else {
-		p, beginFill := n.remoteCache.GetCacheOrBeginFill(h.inodeKey, offset)
-		if p != nil {
-			log.Debugf("Success: readChunkRemote (cached), h=%v, offset=%v, size=%v", h, offset, size)
-			slice := p.AsSlice(n.remoteCache.dec)
-			return slice, len(slice.Buf), RaftBasicReply{reply: RaftReplyOk}
-		} else if !beginFill {
-			return SlicedPageBuffer{}, 0, RaftBasicReply{reply: ErrnoToReply(unix.EAGAIN)}
-		}
-	}
-
-	remoteBuf, err := n.remoteCache.GetRemotePageBuffer(h.inodeKey, offset, h.chunkSize, blocking)
-	if err != nil {
-		if blocking || (!blocking && err != unix.EAGAIN) {
-			log.Errorf("Failed: readChunkRemote, GetPageBuffer, chunkSize=%v, err=%v", h.chunkSize, err)
-		}
-		n.remoteCache.EndFill(h.inodeKey, offset)
-		return SlicedPageBuffer{}, 0, RaftBasicReply{reply: ErrnoToReply(err)}
-	}
-	var r = RaftBasicReply{reply: RaftReplyOk}
-	var c = 0
-	var rpcTime time.Duration
-	for c < length {
-		args := &common.DownloadChunkArgs{
-			Handler: h.toMsg(), Key: key, Offset: offset + int64(c), Length: int32(length - c),
-		}
-		msg := &common.DownloadChunkRet{}
-		rpcArgs := &RpcSeqNumArgs{data: remoteBuf.buf.Buf[c:length]}
-		rpcBegin := time.Now()
-		r.reply = n.rpcClient.CallObjcacheRpc(RpcDownloadChunkViaRemoteCmdId, args, node.addr, time.Duration(0), n.raft.files, nil, rpcArgs, msg)
-		rpcTime += time.Since(rpcBegin)
-		if r.reply != RaftReplyOk {
-			n.remoteCache.ReleaseInFlightBuffer(remoteBuf)
-			n.remoteCache.EndFill(h.inodeKey, offset)
-			log.Errorf("Failed: readChunkRemote, CallObjcacheRpc, Node=%v, meta=%v, offset=%v, reply=%v", node, h, offset, r.reply)
-			return SlicedPageBuffer{}, 0, r
-		}
-		r = NewRaftBasicReply(msg.GetStatus(), msg.GetLeader())
-		if r.reply != RaftReplyOk {
-			n.remoteCache.ReleaseInFlightBuffer(remoteBuf)
-			n.remoteCache.EndFill(h.inodeKey, offset)
-			log.Errorf("Failed: readChunkRemote, CallObjcacheRpc, Node=%v, meta=%v, offset=%v, reply=%v", node, h, offset, r.reply)
-			return SlicedPageBuffer{}, 0, r
-		}
-		c += int(msg.GetCount())
-	}
-	remoteBuf.buf.Buf = remoteBuf.buf.Buf[:c]
-	remoteBuf.buf.Up()
-	slice := remoteBuf.AsSlice(n.remoteCache.dec)
-	n.remoteCache.EndFillWithPut(remoteBuf)
-	log.Debugf("Success: readChunkRemote, node=%v, h=%v, offset=%v, len=%v, count=%v, rpcTime=%v, elapsed=%v", node, h, offset, length, c, rpcTime, time.Since(begin))
-	return slice, c, r
-}
-
-/*
-	func (n *NodeServer) ReadChunk(h MetaRWHandler, key string, offset int64, data []byte) (buf *PageBuffer, count int, err error) {
-		if h.size == 0 {
-			return nil, 0, nil
-		}
-		begin := time.Now()
-		var nodeList *RaftNodeList
-		var leader RaftNode
-		for i := 0; i < n.flags.MaxRetry; i++ {
-			l := n.raftGroup.GetNodeListLocal()
-			if nodeList == nil || nodeList.version != l.version {
-				var reply int32
-				leader, nodeList, reply = n.raftGroup.getChunkOwnerNodeLocal(h.inodeKey, offset, h.chunkSize)
-				if reply != RaftReplyOk {
-					log.Errorf("Failed: ReadChunk, getKeyOwnerNodeAny, inodeKey=%v, offset=%v, reply=%v", h.inodeKey, offset, reply)
-					return nil, 0, ReplyToFuseErr(reply)
-				}
-			}
-			var r RaftBasicReply
-			if leader.nodeId == n.raft.selfId {
-				if r = n.raftGroup.BeginRaftRead(n.raft, nodeList.version); r.reply == RaftReplyOk {
-					buf, count, r.reply = n.inodeMgr.ReadChunk(h, key, offset, data)
-				}
-			} else {
-				buf, count, r = n.readChunkRemote(leader, h, key, offset, data, len(data))
-			}
-			if r.reply != RaftReplyOk {
-				log.Infof("Failed: ReadChunk, attempt=%v, leader=%v, meta=%v, offset=%v, r=%v", i, leader, h, offset, r)
-				if r.reply != RaftReplyOk {
-					if newLeader, found := fixupRpcErr(n, leader, r); found {
-						leader = newLeader
-					}
-				}
-				if needRetry(r.reply) {
-					continue
-				}
-				err = ReplyToFuseErr(r.reply)
-			} else if i > 0 {
-				n.raftGroup.UpdateLeader(leader)
-			}
-			break
-		}
-		endAll := time.Now()
-		log.Debugf("Success: ReadChunk, local=%v, inode=%v, key=%v, offset=%v, count=%v, elapsed=%v",
-			leader.nodeId == n.raft.selfId, h.inodeKey, key, offset, count, endAll.Sub(begin))
-		return
-	}
-*/
-func (n *NodeServer) ReadAheadChunk(h MetaRWHandler, key string, offset int64, size int64) {
+func (n *NodeServer) ReadAheadChunk(h MetaRWHandler, offset int64, size int64) {
 	if n.flags.DisableLocalWritebackCaching {
 		return
 	}
@@ -496,313 +329,12 @@ func (n *NodeServer) ReadAheadChunk(h MetaRWHandler, key string, offset int64, s
 		if length > int(h.chunkSize) {
 			length = int(h.chunkSize)
 		}
-		leader, nodeList, reply := n.raftGroup.getChunkOwnerNodeLocal(h.inodeKey, alignedOffset, h.chunkSize)
-		if reply != RaftReplyOk {
-			log.Errorf("Failed: ReadAheadChunk, getKeyOwnerNodeAny, inodeKey=%v, alignedOffset=%v, reply=%v", h.inodeKey, alignedOffset, reply)
-			return
-		}
-		if leader.nodeId == n.raft.selfId {
-			if cachedLength, ok := n.localHistory.Has(h.inodeKey, alignedOffset); ok && cachedLength == length {
-				off = alignedOffset + int64(length)
-				continue
-			}
-			go func(alignedOffset int64, length int) {
-				if r := n.raftGroup.BeginRaftRead(n.raft, nodeList.version); r.reply != RaftReplyOk {
-					return
-				}
-				bufs, c, reply := n.inodeMgr.VectorReadChunk(h, key, alignedOffset, length, false)
-				if reply != RaftReplyOk {
-					return
-				}
-				n.localHistory.Add(h.inodeKey, alignedOffset, c)
-				for _, buf := range bufs {
-					buf.SetEvictable()
-				}
-			}(alignedOffset, length)
-		} else {
-			if n.remoteCache.Has(h.inodeKey, alignedOffset) {
-				off = alignedOffset + int64(length)
-				continue
-			}
-			go func(alignedOffset int64, length int) {
-				slice, _, r := n.readChunkRemote(leader, h, key, alignedOffset, length, false)
-				if r.reply != RaftReplyOk && r.reply != ErrnoToReply(unix.EAGAIN) {
-					log.Errorf("Failed: ReadAheadChunk, leader=%v, meta=%v, alignedOffset=%v, r=%v", leader, h, alignedOffset, r)
-					if r.reply != RaftReplyOk {
-						if newLeader, found := fixupRpcErr(n, leader, r); found {
-							leader = newLeader
-						}
-					}
-				}
-				if r.reply == RaftReplyOk {
-					slice.SetEvictable()
-				}
-			}(alignedOffset, length)
-		}
+		n.rpcMgr.CallRpc(NewReadChunkOp(h, alignedOffset, length, false, true).GetCaller(n))
 		off = alignedOffset + int64(length)
 	}
 }
 
-func (n *NodeServer) VectorReadFastPath(h MetaRWHandler, key string, offset int64, size int, blocking bool) (bufs []SlicedPageBuffer, count int, err error) {
-	var r RaftBasicReply
-	if _, ok := n.localHistory.Has(h.inodeKey, offset); ok {
-		bufs, count, r.reply = n.inodeMgr.VectorReadChunk(h, key, offset, size, blocking)
-	} else if slice, ok := n.remoteCache.GetCache(h.inodeKey, offset); ok {
-		length := CalculateBufferLengthForDownload(h, offset)
-		if slice.orig != nil && length == len(slice.Buf) {
-			count = length
-			bufs = append(bufs, slice)
-			r.reply = RaftReplyOk
-		} else {
-			slice.SetEvictable()
-		}
-	}
-	if r.reply == RaftReplyOk {
-		return
-	}
-	err = unix.EIO
-	return
-}
-
-func (n *NodeServer) VectorReadChunk(h MetaRWHandler, key string, offset int64, size int, blocking bool) (bufs []SlicedPageBuffer, count int, err error) {
-	if h.size == 0 {
-		return nil, 0, nil
-	}
-	if !n.flags.DisableLocalWritebackCaching {
-		if bufs, count, err = n.VectorReadFastPath(h, key, offset, size, blocking); err == nil {
-			return
-		}
-	}
-	err = nil
-	begin := time.Now()
-	var nodeList *RaftNodeList
-	var leader RaftNode
-	i := 0
-	for ; i < n.flags.MaxRetry; i++ {
-		l := n.raftGroup.GetNodeListLocal()
-		if nodeList == nil || nodeList.version != l.version {
-			var reply int32
-			leader, nodeList, reply = n.raftGroup.getChunkOwnerNodeLocal(h.inodeKey, offset, h.chunkSize)
-			if reply != RaftReplyOk {
-				log.Errorf("Failed: VectorReadChunk, getKeyOwnerNodeAny, inodeKey=%v, offset=%v, reply=%v", h.inodeKey, offset, reply)
-				return nil, 0, ReplyToFuseErr(reply)
-			}
-		}
-		var r RaftBasicReply
-		if leader.nodeId == n.raft.selfId {
-			if r = n.raftGroup.BeginRaftRead(n.raft, nodeList.version); r.reply == RaftReplyOk {
-				bufs, count, r.reply = n.inodeMgr.VectorReadChunk(h, key, offset, size, blocking)
-				if r.reply == RaftReplyOk {
-					n.localHistory.Add(h.inodeKey, offset, count)
-				}
-			}
-		} else {
-			var slice SlicedPageBuffer
-			slice, count, r = n.readChunkRemote(leader, h, key, offset, size, blocking)
-			if r.reply == RaftReplyOk {
-				bufs = append(bufs, slice)
-			}
-		}
-		if !blocking && r.reply == ErrnoToReply(unix.EAGAIN) {
-			err = unix.EAGAIN
-			return
-		}
-		if r.reply != RaftReplyOk {
-			log.Errorf("Failed: VectorReadChunk, attempt=%v, leader=%v, meta=%v, offset=%v, r=%v", i, leader, h, offset, r)
-			if r.reply != RaftReplyOk {
-				if newLeader, found := fixupRpcErr(n, leader, r); found {
-					leader = newLeader
-				}
-			}
-			if needRetry(r.reply) {
-				continue
-			}
-			err = ReplyToFuseErr(r.reply)
-		} else if i > 0 {
-			n.raftGroup.UpdateLeader(leader)
-		}
-		break
-	}
-	endAll := time.Now()
-	if i >= 1 {
-		log.Infof("Success: VectorReadChunk, inode=%v, key=%v, offset=%v, count=%v, retried=%v, elapsed=%v",
-			h.inodeKey, key, offset, count, i, endAll.Sub(begin))
-	} else {
-		log.Debugf("Success: VectorReadChunk, inode=%v, key=%v, offset=%v, count=%v, elapsed=%v",
-			h.inodeKey, key, offset, count, endAll.Sub(begin))
-	}
-	return
-}
-
-/*func (n *NodeServer) downloadChunkLocalFd(h MetaRWHandler, key string, offset int64, fd int) (int, int32) {
-	if n.checkJoining() {
-		log.Errorf("TryAgain: downloadChunkLocalFd, Node is joining, h=%v, offset=%v", h, offset)
-		return 0, ObjCacheReplyJoining
-	}
-
-	working, reply := n.inodeMgr.GetChunkOrSetAtRemote(h, key, offset, n.txMgr.GetFileId())
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: downloadChunkLocalFd, GetChunkOrSetAtRemote, inodeKey=%v, offset=%v, chunkSize=%v, reply=%v", h.inodeKey, offset, h.chunkSize, reply)
-		return 0, reply
-	}
-	reader := working.GetReader(h.chunkSize, h.size, offset, n.raft)
-	length, err2 := reader.GetLen()
-	if err2 != nil {
-		_ = reader.Close()
-		log.Errorf("Failed: downloadChunkLocalFd, GetLen, err=%v", err2)
-		return 0, ErrnoToReply(err2)
-	}
-	if length > int64(math.MaxInt32) {
-		length = int64(math.MaxInt32)
-	}
-	if length <= 0 {
-		_ = reader.Close()
-		return 0, RaftReplyOk
-	}
-	if err := unix.Ftruncate(fd, length); err != nil {
-		_ = reader.Close()
-		log.Errorf("Failed: downloadChunkLocalFd, Ftruncate, length=%v, err=%v", length, err)
-		return 0, ErrnoToReply(err)
-	}
-	buf, errno := unix.Mmap(fd, 0, int(length), unix.PROT_WRITE|unix.PROT_READ, unix.MAP_SHARED|unix.MAP_POPULATE)
-	if errno != nil {
-		_ = reader.Close()
-		log.Errorf("Failed: Mmap at mmapFileHandle, fd=%v, length=%v, errno=%v", fd, length, errno)
-		return 0, ErrnoToReply(errno)
-	}
-	c, err := reader.Read(buf)
-	if err != nil && err != io.EOF {
-		log.Errorf("Failed: downloadChunkLocalFd, Read, offset=%v, err=%v", offset%h.chunkSize, err)
-	}
-	_ = reader.Close()
-	if err2 := unix.Munmap(buf); err2 != nil {
-		log.Errorf("Failed (ignore): downloadChunkLocalFd, Munmap, err=%v", err2)
-	}
-	if err != nil {
-		log.Errorf("Failed: downloadChunkLocalFd, inodeKey=%v, err=%v", h.inodeKey, err)
-		return c, ErrnoToReply(err)
-	}
-	return c, RaftReplyOk
-}
-
-func (n *NodeServer) downloadChunkRemoteFd(node RaftNode, h MetaRWHandler, key string, offset int64, fd int) (c int, r RaftBasicReply) {
-	length := CalculateBufferLengthForDownload(h, offset)
-	for c < length {
-		args := &DownloadChunkArgs{
-			Handler: h.toMsg(), Key: key, Offset: offset + int64(c), Length: int32(length - c),
-		}
-		msg := &DownloadChunkRet{}
-		rpcArgs := &RpcSeqNumArgs{fd: fd, fileOffset: (offset + int64(c)) % h.chunkSize}
-		r.reply = n.rpcClient.CallObjcacheRpc(RpcDownloadChunkViaRemoteCmdId, args, node.addr, n.flags.ChunkRpcTimeoutDuration, n.raft.files, nil, rpcArgs, msg)
-		if r.reply != RaftReplyOk {
-			fixupRpcErr(n, node, r)
-			log.Debugf("Failed: downloadChunkRemoteFd, CallObjcacheRpc, Node=%v, h=%v, offset=%v, reply=%v", node, h, offset, r.reply)
-			return 0, r
-		}
-		r = NewRaftBasicReply(msg.GetStatus(), msg.GetLeader())
-		if r.reply != RaftReplyOk {
-			log.Errorf("Failed: downloadChunkRemoteFd, CallObjcacheRpc, r=%v", r)
-			return 0, r
-		}
-		c += int(msg.GetCount())
-	}
-	log.Debugf("Success: downloadChunkRemoteFd, node=%v, h=%v, offset=%v, len=%v, count=%v", node, h, offset, length, c)
-	return c, r
-}
-
-func (n *NodeServer) DownloadChunkAnyFd(h MetaRWHandler, key string, offset int64, fd int) (c int, err error) {
-	for i := 0; i < n.flags.MaxRetry; i++ {
-		leader, nodeList, reply := n.raftGroup.getChunkOwnerNodeLocal(h.inodeKey, offset, h.chunkSize)
-		if reply != RaftReplyOk {
-			log.Errorf("Failed: DownloadChunkAnyFd, getKeyOwnerNodeAny, inodeKey=%v, offset=%v, reply=%v", h.inodeKey, offset, reply)
-			return -1, ReplyToFuseErr(reply)
-		}
-		var r RaftBasicReply
-		if leader.nodeId == n.raft.selfId {
-			r = n.raftGroup.BeginRaftRead(n.raft, nodeList.version)
-			if r.reply == RaftReplyOk {
-				c, r.reply = n.downloadChunkLocalFd(h, key, offset, fd)
-			}
-			if r.reply != RaftReplyOk {
-				fixupLocalErr(n, leader.groupId, r)
-			}
-		} else {
-			c, r = n.downloadChunkRemoteFd(leader, h, key, offset, fd)
-		}
-		if r.reply != RaftReplyOk {
-			log.Infof("Failed: DownloadChunkAnyFd, attempt=%v, leader=%v, h=%v, offset=%v, r=%v", i, leader, h, offset, r)
-			//latestMeta = <-metaChan
-			if needRetry(r.reply) {
-				continue
-			}
-			err = ReplyToFuseErr(r.reply)
-		}
-		break
-	}
-	if c == 0 && err == nil {
-		err = io.EOF
-	}
-	return
-}*/
-
-func (n *NodeServer) PrefetchChunk(msg RpcMsg) *common.Ack {
-	args := &common.PrefetchChunkArgs{}
-	if reply := msg.ParseExecProtoBufMessage(args); reply != RaftReplyOk {
-		log.Errorf("Failed: PrefetchChunk, ParseExecProtoBufMessage, reply=%v", reply)
-		return &common.Ack{Status: reply}
-	}
-	r := n.raftGroup.BeginRaftRead(n.raft, args.GetNodeListVer())
-	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: PrefetchChunk, BeginRaftRead, r=%v", r)
-		return &common.Ack{Status: r.reply, Leader: r.GetLeaderNodeMsg()}
-	}
-	h := NewMetaRWHandlerFromMsg(args.GetHandler())
-	offset := args.GetOffset()
-	length := args.GetLength()
-	for off := offset; off < offset+length && off < h.size; off += h.chunkSize {
-		leader, _, reply := n.raftGroup.getChunkOwnerNodeLocal(h.inodeKey, off, h.chunkSize)
-		if reply != RaftReplyOk {
-			log.Errorf("Failed: PrefetchChunk, getKeyOwnerNodeAny, inodeKey=%v, off=%v, reply=%v", h.inodeKey, off, reply)
-			break
-		}
-		if leader.nodeId == n.raft.selfId {
-			go n.inodeMgr.PrefetchChunkThread(h, args.GetKey(), off)
-		}
-	}
-	return &common.Ack{Status: RaftReplyOk, Leader: r.GetLeaderNodeMsg()}
-}
-
-func (n *NodeServer) prefetchChunkThread(h MetaRWHandler, args *common.PrefetchChunkArgs, leader RaftNode, nodeListVer uint64) {
-	var r RaftBasicReply
-	if leader.nodeId == n.raft.selfId {
-		r = n.raftGroup.BeginRaftRead(n.raft, nodeListVer)
-		if r.reply == RaftReplyOk {
-			for off := args.Offset; off < args.Offset+args.Length && off < h.size; off += h.chunkSize {
-				l, _, reply := n.raftGroup.getChunkOwnerNodeLocal(h.inodeKey, off, h.chunkSize)
-				if reply != RaftReplyOk {
-					log.Errorf("Failed: prefetchChunkThread, getKeyOwnerNodeAny, inodeKey=%v, off=%v, reply=%v", h.inodeKey, off, reply)
-					break
-				}
-				if l.nodeId == n.raft.selfId {
-					go n.inodeMgr.PrefetchChunkThread(h, args.Key, off)
-				}
-			}
-		}
-	} else {
-		msg := &common.Ack{}
-		r.reply = n.rpcClient.CallObjcacheRpc(RpcPrefetchChunkCmdId, args, leader.addr, n.flags.ChunkRpcTimeoutDuration, n.raft.files, nil, nil, msg)
-		if r.reply == RaftReplyOk {
-			r = NewRaftBasicReply(msg.GetStatus(), msg.GetLeader())
-		}
-		if r.reply != RaftReplyOk {
-			if newLeader, found := fixupRpcErr(n, leader, r); found {
-				leader = newLeader
-			}
-		}
-	}
-}
-
-func (n *NodeServer) prefetchChunkAny(h MetaRWHandler, key string, offset int64, length int64) {
+func (n *NodeServer) PrefetchChunk(h MetaRWHandler, offset int64, length int64) {
 	groups := make(map[string]bool)
 	l := n.raftGroup.GetNodeListLocal()
 	for off := offset - offset%h.chunkSize; off < offset+length && off < h.size; off += h.chunkSize {
@@ -814,80 +346,29 @@ func (n *NodeServer) prefetchChunkAny(h MetaRWHandler, key string, offset int64,
 		}
 		groupId, ok := GetGroupForChunk(l.ring, h.inodeKey, off, h.chunkSize)
 		if !ok {
-			log.Errorf("Failed: prefetchChunkAny, GetGroupForChunk, l.version=%v, inodeKey=%v, off=%v", l.version, h.inodeKey, off)
+			log.Errorf("Failed: PrefetchChunk, GetGroupForChunk, l.version=%v, inodeKey=%v, off=%v", l.version, h.inodeKey, off)
 			return
 		}
 		groups[groupId] = true
-		//log.Debugf("prefetchChunkAny, need inodeKey=%v, off=%v", h.inodeKey, off)
-	}
-	if len(groups) == 0 {
-		return
-	}
-	args := &common.PrefetchChunkArgs{
-		Handler:     h.toMsg(),
-		Key:         key,
-		Offset:      offset,
-		Length:      length,
-		NodeListVer: l.version,
+		//log.Debugf("PrefetchChunk, need inodeKey=%v, off=%v", h.inodeKey, off)
 	}
 	for groupId := range groups {
 		leader, ok := n.raftGroup.GetGroupLeader(groupId, l)
 		if ok {
-			go n.prefetchChunkThread(h, args, leader, l.version)
+			go n.rpcMgr.CallRpc(NewPrefetchChunkOp(leader, offset, length, h, l.version).GetCaller(n))
 		} else {
-			log.Errorf("Failed: prefetchChunkAny, GetGroupLeader, l.version=%v, inodeKey=%v, groupId=%v", l.version, h.inodeKey, groupId)
+			log.Errorf("Failed: PrefetchChunk, GetGroupLeader, l.version=%v, inodeKey=%v, groupId=%v", l.version, h.inodeKey, groupId)
 		}
 	}
 }
 
 /*************************
- * methods to write chunks
+ * methods to write inodes
  *************************/
 
-func (n *NodeServer) SpliceChunk(fd int, pipeFds [2]int, state *ReadRpcMsgState, inodeKey InodeKeyType, dataLength uint32, offset int64, chunkSize int64) (fileId FileIdType, fileOffset int64, reply int32) {
-	var reserveTime time.Duration
+func (n *NodeServer) WriteChunk(inodeKey InodeKeyType, chunkSize int64, offset int64, size int64, buf []byte) ([]*common.UpdateChunkRecordMsg, int32) {
 	begin := time.Now()
-	fileId = NewFileIdTypeFromInodeKey(inodeKey, offset, chunkSize)
-	if state.optComplete == 1 {
-		fileOffset = n.raft.files.ReserveRange(fileId, int64(dataLength))
-		state.fileOffsetForSplice = fileOffset
-		reserveTime = time.Since(begin)
-	}
-	beginSplice := time.Now()
-	err := n.raft.files.Splice(pipeFds, fileId, fd, state.fileOffsetForSplice, int32(dataLength), &state.bufOffForSplice)
-	if err != nil {
-		log.Errorf("Failed: SpliceChunk, Splice, err=%v", err)
-		reply = ErrnoToReply(err)
-		return
-	}
-	endAll := time.Now()
-	state.completed = uint32(state.bufOffForSplice) >= dataLength
-	log.Debugf("Success: SpliceChunk, dataLength=%v, readLength=%v, completed=%v, reserveTime=%v, splice=%v, elapsed=%v", dataLength, state.bufOffForSplice, state.completed, reserveTime, endAll.Sub(beginSplice), time.Since(begin))
-	return fileId, state.fileOffsetForSplice, RaftReplyOk
-}
-
-func (n *NodeServer) UpdateChunkTopHalf(msg RpcMsg, dataLength uint32, fd int, pipeFds [2]int, state *ReadRpcMsgState) (m proto.Message, fileId FileIdType, fileOffset int64, r RaftBasicReply) {
-	args := &common.UpdateChunkArgs{}
-	if reply := msg.ParseExecProtoBufMessage(args); reply != RaftReplyOk {
-		log.Errorf("Failed: UpdateChunkTopHalf, ParseExecProtoBufMessage, reply=%v", reply)
-		r = RaftBasicReply{reply: reply}
-		state.completed = true
-		return
-	}
-	r = n.raftGroup.BeginRaftRead(n.raft, args.GetNodeListVer())
-	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: UpdateChunkTopHalf, BeginRaftRead, r=%v", r)
-		state.completed = true
-		return
-	}
-	fileId, fileOffset, r.reply = n.SpliceChunk(fd, pipeFds, state, InodeKeyType(args.GetInodeKey()), dataLength, args.GetOffset(), args.GetChunkSize())
-	m = args
-	return
-}
-
-func (n *NodeServer) updateChunksAny(inodeKey InodeKeyType, chunkSize int64, offset int64, size int64, buf []byte) ([]*common.UpdateChunkRecordMsg, int32) {
-	begin := time.Now()
-	id := n.CreateCoordinatorId()
+	id := n.raft.GenerateCoordinatorId()
 	groupRets := map[string][]*common.StagingChunkMsg{}
 	var bufOff = int64(0)
 	var i = uint64(1)
@@ -904,22 +385,19 @@ func (n *NodeServer) updateChunksAny(inodeKey InodeKeyType, chunkSize int64, off
 			dataLen = int64(len(buf)) - bufOff
 		}
 		txId := id.toTxId(i)
-		fn := NewUpdateChunkOp(txId, inodeKey, chunkSize, off, buf[bufOff:bufOff+dataLen])
-		op, r := n.rpcMgr.CallAny(fn, txId, n.flags.ChunkRpcTimeoutDuration)
-		if op.node != nil {
-			if _, ok := groupRets[op.node.GroupId]; !ok {
-				groupRets[op.node.GroupId] = make([]*common.StagingChunkMsg, 0)
-			}
-			if op.ext != nil {
-				groupRets[op.node.GroupId] = append(groupRets[op.node.GroupId], op.ext.(*common.StagingChunkMsg))
-			}
+		op, r := n.rpcMgr.CallRpc(NewUpdateChunkOp(txId, inodeKey, chunkSize, off, buf[bufOff:bufOff+dataLen]).GetCaller(n))
+		if _, ok := groupRets[op.node.groupId]; !ok {
+			groupRets[op.node.groupId] = make([]*common.StagingChunkMsg, 0)
+		}
+		if op.ext != nil {
+			groupRets[op.node.groupId] = append(groupRets[op.node.groupId], op.ext.(*common.StagingChunkMsg))
 		}
 		if r.reply != RaftReplyOk {
 			ret := make([]*common.UpdateChunkRecordMsg, 0)
 			for groupId, stags := range groupRets {
 				ret = append(ret, &common.UpdateChunkRecordMsg{GroupId: groupId, Stags: stags})
 			}
-			log.Debugf("Failed: UpdateChunksAny, inodeKey=%v, offset=%v, size=%v, elapsed=%v, r=%v", inodeKey, offset, size, time.Since(begin), r)
+			log.Debugf("Failed: WriteChunk, inodeKey=%v, offset=%v, size=%v, elapsed=%v, r=%v", inodeKey, offset, size, time.Since(begin), r)
 			return ret, r.reply
 		}
 		off += dataLen
@@ -930,7 +408,7 @@ func (n *NodeServer) updateChunksAny(inodeKey InodeKeyType, chunkSize int64, off
 	for groupId, stags := range groupRets {
 		ret = append(ret, &common.UpdateChunkRecordMsg{GroupId: groupId, Stags: stags})
 	}
-	log.Debugf("Success: UpdateChunksAny, inodeKey=%v, offset=%v, size=%v, i=%v, elapsed=%v", inodeKey, offset, size, i, time.Since(begin))
+	log.Debugf("Success: WriteChunk, inodeKey=%v, offset=%v, size=%v, i=%v, elapsed=%v", inodeKey, offset, size, i, time.Since(begin))
 	return ret, RaftReplyOk
 }
 
@@ -938,12 +416,12 @@ func (n *NodeServer) updateChunksAny(inodeKey InodeKeyType, chunkSize int64, off
  * methods to persist cached files to cloud object storage
  *********************************************************/
 
-func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg, txId TxId, metaKeys []string, meta *WorkingMeta, priority int) (nextTxId TxId, keyUploadIds map[string]string, reply int32) {
-	ret.PrimaryMeta.Chunks = make([]*common.PersistedChunkInfoMsg, 0)
-	keyUploadIds = make(map[string]string)
-	begin := time.Now()
+func (n *NodeServer) persistMultipleChunksMeta(tm *TxIdMgr, metaKeys []string, meta *WorkingMeta, priority int) (ts int64, chunks []*common.PersistedChunkInfoMsg, reply int32) {
+	chunks = make([]*common.PersistedChunkInfoMsg, 0)
+	keyUploadIds := make(map[string]string)
 	uploadIds := make([]string, 0)
-	var beginMsg *common.MpuBeginMsg
+
+	begin := time.Now()
 	var startMpu, mpuAdd, commit time.Time
 	var keyETags map[string][]string
 	var lastErrReply = RaftReplyOk
@@ -961,16 +439,13 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 		uploadIds = append(uploadIds, uploadId)
 		keyUploadIds[metaKey] = uploadId
 	}
-	beginMsg = &common.MpuBeginMsg{TxId: txId.toMsg(), Keys: metaKeys, UploadIds: uploadIds}
-	if lastErrReply = n.raft.AppendExtendedLogEntry(AppendEntryBeginPersistCmdId, beginMsg); lastErrReply != RaftReplyOk {
+	if lastErrReply = n.raft.AppendExtendedLogEntry(NewBeginPersistCommand(tm.GetNextId(), metaKeys, uploadIds)); lastErrReply != RaftReplyOk {
 		log.Errorf("Failed: persistMultipleChunksMeta, AppendBeginPersistLog, keys=%v, reply=%v", metaKeys, lastErrReply)
 		goto mpuAbort
 	}
-	txId = txId.GetNext()
 	startMpu = time.Now()
 
 	keyETags = make(map[string][]string)
-	ret.PrimaryMeta.Chunks = make([]*common.PersistedChunkInfoMsg, 0)
 	for metaKey, uploadId := range keyUploadIds {
 		keyETags[metaKey] = make([]string, (meta.size+meta.chunkSize-1)/meta.chunkSize)
 		offsets := make(map[RaftNode][]int64)
@@ -987,7 +462,7 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 			if len(offsets[node]) > 1024 {
 				offs := make([]int64, len(offsets[node]))
 				copy(offs, offsets[node])
-				op := NewMpuAddOp(node, nodeList.version, txId, metaKey, meta, offs, uploadId, priority)
+				op := NewMpuAddOp(node, nodeList.version, tm.GetNextId(), metaKey, meta, offs, uploadId, priority)
 				if node.nodeId == n.raft.selfId {
 					localOps = append(localOps, op)
 				} else {
@@ -996,12 +471,11 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 						ctxs = append(ctxs, ctx)
 					}
 				}
-				txId = txId.GetNext()
 				delete(offsets, node)
 			}
 		}
 		for node, offsets := range offsets {
-			op := NewMpuAddOp(node, nodeList.version, txId, metaKey, meta, offsets, uploadId, priority)
+			op := NewMpuAddOp(node, nodeList.version, tm.GetNextId(), metaKey, meta, offsets, uploadId, priority)
 			if node.nodeId == n.raft.selfId {
 				localOps = append(localOps, op)
 			} else {
@@ -1010,16 +484,15 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 					ctxs = append(ctxs, ctx)
 				}
 			}
-			txId = txId.GetNext()
 		}
 		lastErrReply = RaftReplyOk
 		for _, localOp := range localOps {
-			rpcRet, r := n.rpcMgr.__execParticipant(localOp, localOp.txId, localOp.nodeListVer, false, false)
+			rpcRet, r := n.rpcMgr.CallRpc(localOp.GetCaller(n))
 			lastErrReply = r.reply
 			if r.reply == RaftReplyOk {
 				outs := rpcRet.ext.([]MpuAddOut)
 				c := &common.PersistedChunkInfoMsg{
-					TxSeqNum: localOp.txId.TxSeqNum, GroupId: n.raftGroup.selfGroup,
+					TxId: localOp.txId.toMsg(), GroupId: n.raftGroup.selfGroup,
 					Offsets: make([]int64, len(outs)), CVers: make([]uint32, len(outs)),
 				}
 				for i, out := range outs {
@@ -1027,7 +500,8 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 					c.Offsets[i] = int64(out.idx) * meta.chunkSize
 					c.CVers[i] = out.cVer
 				}
-				ret.PrimaryMeta.Chunks = append(ret.PrimaryMeta.Chunks, c)
+				chunks = append(chunks, c)
+				tm.AddTx(localOp.txId, rpcRet)
 			}
 		}
 		for _, ctx := range ctxs {
@@ -1035,7 +509,7 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 			lastErrReply = r.reply
 			if r.reply == RaftReplyOk {
 				c := &common.PersistedChunkInfoMsg{
-					TxSeqNum: ctx.txId.TxSeqNum, GroupId: ctx.node.groupId,
+					TxId: ctx.txId.toMsg(), GroupId: ctx.node.groupId,
 					Offsets: make([]int64, len(outs)), CVers: make([]uint32, len(outs)),
 				}
 				for i, out := range outs {
@@ -1043,7 +517,8 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 					c.Offsets[i] = int64(out.idx) * meta.chunkSize
 					c.CVers[i] = out.cVer
 				}
-				ret.PrimaryMeta.Chunks = append(ret.PrimaryMeta.Chunks, c)
+				chunks = append(chunks, c)
+				tm.AddTx(ctx.txId, RpcRet{node: ctx.node})
 			}
 		}
 		if lastErrReply != RaftReplyOk {
@@ -1053,7 +528,7 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 	mpuAdd = time.Now()
 
 	for metaKey, uploadId := range keyUploadIds {
-		ret.PrimaryMeta.Ts, lastErrReply = n.inodeMgr.MpuCommit(metaKey, uploadId, keyETags[metaKey])
+		ts, lastErrReply = n.inodeMgr.MpuCommit(metaKey, uploadId, keyETags[metaKey])
 		if lastErrReply != RaftReplyOk {
 			log.Errorf("Failed: persistMultipleChunksMeta, MpuCommit, reply=%v", lastErrReply)
 			goto mpuAbort
@@ -1062,16 +537,12 @@ func (n *NodeServer) persistMultipleChunksMeta(ret *common.TwoPCPersistRecordMsg
 		log.Debugf("Success: persistMultipleChunksMeta, metaKey=%v, inodeKey=%v, length=%v, mpubegin=%v, mpuadd=%v, commit=%v",
 			metaKey, meta.inodeKey, meta.size, startMpu.Sub(begin), mpuAdd.Sub(startMpu), commit.Sub(mpuAdd))
 	}
-	return txId, keyUploadIds, RaftReplyOk
+	return ts, chunks, RaftReplyOk
 mpuAbort:
-	for _, chunk := range ret.PrimaryMeta.Chunks {
-		txId2 := txId.GetVariant(chunk.GetTxSeqNum())
-		n.rpcMgr.CallRpcAnyNoFail(NewAbortParticipantOp(txId2, []*common.TxIdMsg{}, chunk.GetGroupId()), txId2, n.flags.RpcTimeoutDuration)
-	}
 	for metaKey, uploadId := range keyUploadIds {
 		n.inodeMgr.MpuAbort(metaKey, uploadId)
 	}
-	return txId, nil, lastErrReply
+	return ts, nil, lastErrReply
 }
 
 func (n *NodeServer) flushExpired() {
@@ -1081,16 +552,16 @@ func (n *NodeServer) flushExpired() {
 	dirtyKeys := n.dirtyMgr.CopyAllExpiredPrimaryDirtyMeta()
 	for _, inodeKey := range dirtyKeys {
 		log.Debugf("flushExpired: Start flushing inodeKey=%v", inodeKey)
-		_, reply := n.CallCoordinator(NewCoordinatorPersistOp(inodeKey, 0))
-		if reply != RaftReplyOk {
+		_, r := n.rpcMgr.CallRpc(NewCoordinatorPersistOp(n.raft.GenerateCoordinatorId(), inodeKey, 0).GetCaller(n))
+		if r.reply != RaftReplyOk {
 			break
 		}
 	}
 	deletedKeys := n.dirtyMgr.CopyAllExpiredPrimaryDeletedDirtyMeta()
 	for key, inodeKey := range deletedKeys {
 		log.Debugf("flushExpired: Start flushing deleted inodeKey=%v", inodeKey)
-		_, reply := n.CallCoordinator(NewCoordinatorDeletePersistOp(key, inodeKey, 0))
-		if reply != RaftReplyOk {
+		_, r := n.rpcMgr.CallRpc(NewCoordinatorDeletePersistOp(n.raft.GenerateCoordinatorId(), key, inodeKey, 0).GetCaller(n))
+		if r.reply != RaftReplyOk {
 			break
 		}
 	}
@@ -1100,35 +571,38 @@ func (n *NodeServer) dropChunkMetaCache() int32 {
 	n.localHistory.DropAll()
 	n.remoteCache.DropAll()
 	n.inodeMgr.Clean(n.dirtyMgr)
-	current := n.raft.files.GetDiskUsage()
-	n.inodeMgr.chunkMapLock.RLock()
+	current := n.raft.extLogger.GetDiskUsage()
+	n.inodeMgr.inodeLock.RLock()
 	chunks := make([]*Chunk, 0)
-	msg := &common.DropLRUChunksArgs{InodeKeys: make([]uint64, 0), Offsets: make([]int64, 0)}
-	for inodeKey, offs := range n.inodeMgr.chunkMap {
-		for off, chunk := range offs {
+	inodeKeys := make([]uint64, 0)
+	offsets := make([]int64, 0)
+	for inodeKey, inode := range n.inodeMgr.inodes {
+		inode.chunkLock.RLock()
+		for off, chunk := range inode.chunkMap {
 			if n.dirtyMgr.IsDirtyChunk(chunk) {
 				log.Warnf("dropChunkMetaCache, chunk is dirty, inodeKey=%v, offset=%v", inodeKey, off)
 				continue
 			}
 			chunks = append(chunks, chunk)
-			msg.InodeKeys = append(msg.InodeKeys, uint64(inodeKey))
-			msg.Offsets = append(msg.Offsets, off)
+			inodeKeys = append(inodeKeys, uint64(inodeKey))
+			offsets = append(offsets, off)
 			chunk.lock.Lock()
 		}
+		inode.chunkLock.RUnlock()
 	}
-	n.inodeMgr.chunkMapLock.RUnlock()
+	n.inodeMgr.inodeLock.RUnlock()
 	if len(chunks) > 0 {
-		reply := n.raft.AppendExtendedLogEntry(AppendEntryDropLRUChunksCmdId, msg)
+		reply := n.raft.AppendExtendedLogEntry(NewDropLRUChunksCommand(inodeKeys, offsets))
 		if reply != RaftReplyOk {
-			log.Errorf("Failed: dropChunkMetaCache, AppendExtendedLogEntry, msg=%v, reply=%v", msg, reply)
+			log.Errorf("Failed: dropChunkMetaCache, AppendExtendedLogEntry, keys=%v, offsets=%v, reply=%v", inodeKeys, offsets, reply)
 			return reply
 		}
 		for _, c := range chunks {
 			c.lock.Unlock()
 		}
 	}
-	n.raft.files.Clear()
-	updated := n.raft.files.GetDiskUsage()
+	n.raft.extLogger.Clear()
+	updated := n.raft.extLogger.GetDiskUsage()
 	log.Infof("Success: dropChunkMetaCache, prev=%v, now=%v, size=%v", current, updated, current-updated)
 	return RaftReplyOk
 }
@@ -1139,17 +613,16 @@ func (n *NodeServer) DropCache(_ context.Context, _ *api.Void) (*api.ApiRet, err
 	if r.reply != RaftReplyOk {
 		return &api.ApiRet{Status: r.reply}, nil
 	}
-	n.inodeMgr.waitNodeResume()
-	n.inodeMgr.SuspendNode()
+	n.LockNode()
 	if n.fs != nil {
-		if err := n.fs.Reset(); err != nil {
+		if err := n.fs.Reset(false); err != nil {
 			log.Errorf("Failed: DropCache, fs.Reset, err=%v", err)
 			return &api.ApiRet{Status: ErrnoToReply(err)}, nil
 		}
 	}
 	if r.reply = n.dirtyMgr.AppendForgetAllDirtyLog(n.raft); r.reply != RaftReplyOk {
 		log.Errorf("Failed: DropCache, AppendForgetAllDirtyLog, reply=%v", r.reply)
-		n.inodeMgr.ResumeNode()
+		n.UnlockNode()
 		if n.fs != nil {
 			n.fs.EndReset() // unblock FS operations
 		}
@@ -1162,7 +635,7 @@ func (n *NodeServer) DropCache(_ context.Context, _ *api.Void) (*api.ApiRet, err
 	if n.fs != nil {
 		n.fs.EndReset() // unblock FS operations
 	}
-	n.inodeMgr.ResumeNode()
+	n.UnlockNode()
 	return &api.ApiRet{Status: reply}, nil
 }
 
@@ -1170,7 +643,7 @@ func (n *NodeServer) dropLRUCacheOnDisk(cacheCapacityBytes int64) {
 	if r := n.raft.IsLeader(); r.reply != RaftReplyOk {
 		return
 	}
-	current := n.raft.files.GetDiskUsage()
+	current := n.raft.extLogger.GetDiskUsage()
 	if current <= cacheCapacityBytes {
 		return
 	}
@@ -1179,8 +652,8 @@ func (n *NodeServer) dropLRUCacheOnDisk(cacheCapacityBytes int64) {
 		opened = n.fs.GetOpenInodes()
 	}
 	targetDropSize := (current - cacheCapacityBytes) * 2
-	msg := CollectLRUChunks(n.dirtyMgr, n.raft, targetDropSize)
-	if len(msg.InodeKeys) == 0 {
+	inodeKeys, offsets := CollectLRUChunks(n.dirtyMgr, n.raft, targetDropSize)
+	if len(inodeKeys) == 0 {
 		keys := CollectLRUDirtyKeys(n.dirtyMgr, n.raft, targetDropSize)
 		falsePositives := make([]uint64, 0)
 		for inodeKey := range keys {
@@ -1189,9 +662,9 @@ func (n *NodeServer) dropLRUCacheOnDisk(cacheCapacityBytes int64) {
 				continue
 			}
 			log.Debugf("dropLRUCacheOnDisk: Start flushing inodeKey=%v", inodeKey)
-			ret, reply := n.CallCoordinator(NewCoordinatorPersistOp(inodeKey, 0))
-			if reply == RaftReplyOk {
-				if ret.extReply == ObjCacheIsNotDirty {
+			ret, r := n.rpcMgr.CallRpc(NewCoordinatorPersistOp(n.raft.GenerateCoordinatorId(), inodeKey, 0).GetCaller(n))
+			if r.reply == RaftReplyOk {
+				if ret.ext.(*CoordinatorRet).extReply == ObjCacheIsNotDirty {
 					falsePositives = append(falsePositives, uint64(inodeKey))
 				}
 			} else {
@@ -1201,35 +674,37 @@ func (n *NodeServer) dropLRUCacheOnDisk(cacheCapacityBytes int64) {
 		if reply := n.dirtyMgr.AppendRemoveNonDirtyChunksLog(n.raft, falsePositives); reply != RaftReplyOk {
 			log.Errorf("Failed (ignore): dropLRUCacheOnDisk, AppendRemoveNonDirtyChunksLog, falsePositives=%v", falsePositives)
 		}
-		msg = CollectLRUChunks(n.dirtyMgr, n.raft, targetDropSize)
-		if len(msg.InodeKeys) == 0 {
+		inodeKeys, offsets = CollectLRUChunks(n.dirtyMgr, n.raft, targetDropSize)
+		if len(inodeKeys) == 0 {
 			return
 		}
 	}
 	chunks := make([]*Chunk, 0)
-	n.inodeMgr.chunkMapLock.RLock()
-	for _, key := range msg.InodeKeys {
+	n.inodeMgr.inodeLock.RLock()
+	for _, key := range inodeKeys {
 		inodeKey := InodeKeyType(key)
-		cs, ok := n.inodeMgr.chunkMap[inodeKey]
+		inode, ok := n.inodeMgr.inodes[inodeKey]
 		if !ok {
 			continue
 		}
-		for _, c := range cs {
+		inode.chunkLock.RLock()
+		for _, c := range inode.chunkMap {
 			if c.lock.TryLock() {
 				chunks = append(chunks, c)
 			}
 		}
+		inode.chunkLock.RUnlock()
 	}
-	n.inodeMgr.chunkMapLock.RUnlock()
-	reply := n.raft.AppendExtendedLogEntry(AppendEntryDropLRUChunksCmdId, msg)
+	n.inodeMgr.inodeLock.RUnlock()
+	reply := n.raft.AppendExtendedLogEntry(NewDropLRUChunksCommand(inodeKeys, offsets))
 	if reply != RaftReplyOk {
-		log.Errorf("Failed: dropLRUCacheOnDisk, AppendExtendedLogEntry, msg=%v, reply=%v", msg, reply)
+		log.Errorf("Failed: dropLRUCacheOnDisk, AppendExtendedLogEntry, inodeKeys=%v, offsets=%v, reply=%v", inodeKeys, offsets, reply)
 		return
 	}
 	for _, c := range chunks {
 		c.lock.Unlock()
 	}
-	updated := n.raft.files.GetDiskUsage()
+	updated := n.raft.extLogger.GetDiskUsage()
 	if updated < current {
 		log.Infof("Success: dropLRUCacheOnDisk, prev=%v, now=%v, size=%v", current, updated, current-updated)
 	}
@@ -1260,89 +735,34 @@ func (n *NodeServer) ExecRpcThread(msg RpcMsg, sa common.NodeAddrInet4, fd int) 
 	seqNum := msg.GetExecProtoBufRpcSeqNum(payload)
 	var buffer []SlicedPageBuffer = nil
 	var ret proto.Message
-	switch rpcId {
-	case RpcCommitParticipantCmdId:
-		ret = n.rpcMgr.CommitParticipant(msg)
-	case RpcCommitMigrationParticipantCmdId:
-		ret = n.rpcMgr.CommitMigrationParticipant(msg)
-	case RpcAbortParticipantCmdId:
-		ret = n.rpcMgr.AbortParticipant(msg)
-	case RpcCreateMetaCmdId:
-		ret = n.rpcMgr.CreateMeta(msg)
-	case RpcLinkMetaCmdId:
-		ret = n.rpcMgr.LinkMeta(msg)
-	case RpcTruncateMetaCmdId:
-		ret = n.rpcMgr.TruncateMeta(msg)
-	case RpcUpdateMetaSizeCmdId:
-		ret = n.rpcMgr.UpdateMetaSize(msg)
-	case RpcDeleteMetaCmdId:
-		ret = n.rpcMgr.DeleteMeta(msg)
-	case RpcUnlinkMetaCmdId:
-		ret = n.rpcMgr.UnlinkMeta(msg)
-	case RpcRenameMetaCmdId:
-		ret = n.rpcMgr.RenameMeta(msg)
-	case RpcCommitUpdateChunkCmdId:
-		ret = n.rpcMgr.CommitUpdateChunk(msg)
-	case RpcCommitDeleteChunkCmdId:
-		ret = n.rpcMgr.CommitDeleteChunk(msg)
-	case RpcCommitExpandChunkCmdId:
-		ret = n.rpcMgr.CommitExpandChunk(msg)
-	case RpcCommitPersistChunkCmdId:
-		ret = n.rpcMgr.CommitPersistChunk(msg)
-	case RpcUpdateNodeListCmdId:
-		ret = n.rpcMgr.UpdateNodeList(msg)
-	case RpcInitNodeListCmdId:
-		ret = n.rpcMgr.InitNodeList(msg)
-	case RpcCreateChildMetaCmdId:
-		ret = n.rpcMgr.CreateChildMeta(msg)
-	case RpcCoordinatorUpdateNodeListCmdId:
-		ret = n.rpcMgr.CoordinatorUpdateNodeList(msg)
-	//case RpcCoordinatorAbortTxCmdId:
-	//	ret = n.rpcMgr.CoordinatorAbort(msg)
-	case RpcMpuAddCmdId:
-		ret = n.rpcMgr.MpuAdd(msg)
-	case RpcJoinMigrationCmdId:
-		ret = n.rpcMgr.JoinMigration(msg)
-	case RpcLeaveMigrationCmdId:
-		ret = n.rpcMgr.LeaveMigration(msg)
-	case RpcCoordinatorFlushObjectCmdId:
-		ret = n.rpcMgr.CoordinatorFlushObject(msg)
-	case RpcCoordinatorTruncateObjectCmdId:
-		ret = n.rpcMgr.CoordinatorTruncateObject(msg)
-	case RpcCoordinatorDeleteObjectCmdId:
-		ret = n.rpcMgr.CoordinatorDeleteObject(msg)
-	case RpcCoordinatorHardLinkObjectCmdId:
-		ret = n.rpcMgr.CoordinatorHardLinkObject(msg)
-	case RpcCoordinatorRenameObjectCmdId:
-		ret = n.rpcMgr.CoordinatorRenameObject(msg)
-	case RpcCoordinatorCreateObjectCmdId:
-		ret = n.rpcMgr.CoordinatorCreateObject(msg)
-	case RpcCoordinatorPersistCmdId:
-		ret = n.rpcMgr.CoordinatorPersist(msg)
-	case RpcRestoreDirtyMetasCmdId:
-		ret = n.rpcMgr.RestoreDirtyMeta(msg)
-	case RpcGetApiIpAndPortCmdId:
-		ret = n.GetApiIpAndPort(msg)
-	case RpcPrefetchChunkCmdId:
-		ret = n.PrefetchChunk(msg)
-	case RpcDownloadChunkViaRemoteCmdId:
-		ret, buffer = n.DownloadChunkViaRemote(msg)
-	case RpcGetMetaCmdId:
-		ret = n.GetMetaRpc(msg)
-	case RpcCoordinatorDeletePersistCmdId:
-		ret = n.rpcMgr.CoordinatorDeletePersist(msg)
-	case RpcUpdateMetaKeyCmdId:
-		ret = n.rpcMgr.UpdateMetaKey(msg)
-	case RpcUpdateMetaAttrCmdId:
-		ret = n.rpcMgr.UpdateMetaAttr(msg)
-	case RpcGetApiPortCmdId:
-		ret = n.rpcMgr.GetApiPort(msg)
-	case RpcRestoreDirtyChunksCmdId:
-		fallthrough
-	case RpcUpdateChunkCmdId:
+	if newFn, ok := SingleShotOpMap[rpcId]; ok {
+		fn, nodeListVer, reply := newFn(msg)
+		if reply != RaftReplyOk {
+			ret, buffer = fn.RetToMsg(nil, RaftBasicReply{reply: reply})
+		} else {
+			orig, r := fn.GetCaller(n).ExecLocalInRpc(n, nodeListVer)
+			ret, buffer = fn.RetToMsg(orig.ext, r)
+		}
+	} else if newFn, ok := ParticipantOpMap[rpcId]; ok {
+		fn, nodeListVer, reply := newFn(msg)
+		if reply != RaftReplyOk {
+			ret, buffer = fn.RetToMsg(nil, RaftBasicReply{reply: reply})
+		} else {
+			orig, r := fn.GetCaller(n).ExecLocalInRpc(n, nodeListVer)
+			ret, buffer = fn.RetToMsg(orig.ext, r)
+		}
+	} else if newFn, ok := CoordinatorOpMap[rpcId]; ok {
+		fn, nodeListVer, reply := newFn(msg)
+		if reply != RaftReplyOk {
+			ret = fn.RetToMsg(nil, RaftBasicReply{reply: reply})
+		} else {
+			orig, r := fn.GetCaller(n).ExecLocalInRpc(n, nodeListVer)
+			ret = fn.RetToMsg(orig.ext, r)
+		}
+	} else if rpcId == RpcRestoreDirtyChunksCmdId || rpcId == RpcUpdateChunkCmdId {
 		log.Errorf("BUG (ignore): ExecRpc, rpcId=%v should be handled at ExecDataRpc", rpcId)
 		return
-	default:
+	} else {
 		log.Errorf("Failed (ignore): ExecRpc, unknown rpcId=%v", rpcId)
 		return
 	}
@@ -1368,40 +788,26 @@ func (n *NodeServer) ExecRpcThread(msg RpcMsg, sa common.NodeAddrInet4, fd int) 
 	//log.Debugf("Success: ExecRpc, rpcId=%v, seqNum=%v", rpcId, seqNum)
 }
 
-func (n *NodeServer) ExecDataRpc(msg RpcMsg, sa common.NodeAddrInet4, fd int, pipeFds [2]int, state *ReadRpcMsgState) (noData bool) {
-	payload := msg.GetCmdPayload()
-	rpcId := msg.GetExecProtoBufRpcId(payload)
-	seqNum := msg.GetExecProtoBufRpcSeqNum(payload)
-	dataLength, _ := msg.GetOptControlHeader()
-	noData = rpcId&DataCmdIdBit == 0
-	if noData {
-		state.completed = true
-		return
+func (n *NodeServer) __replyFn(msg RpcMsg, sa common.NodeAddrInet4, fd int, state *ReadRpcMsgState, rpcId uint16, seqNum uint64, m proto.Message, disk *OnDiskLog, vec *DiskWriteVector, logId LogIdType, dataLength uint32) {
+	reply := RaftReplyFail
+	logOffset := int64(0)
+	if disk != nil && vec != nil {
+		sizeIncrease, err := disk.EndWrite(vec)
+		reply = ErrnoToReply(err)
+		if err != nil {
+			log.Errorf("Failed: ExecDataRpc, EndWrite, err=%v", err)
+		} else {
+			logOffset = vec.logOffset
+		}
+		n.raft.extLogger.PutDiskLog(logId, vec, sizeIncrease)
 	}
-	var m proto.Message
-	var fileId FileIdType
-	var fileOffset int64
-	var r RaftBasicReply
-	switch rpcId {
-	case RpcUpdateChunkCmdId:
-		m, fileId, fileOffset, r = n.UpdateChunkTopHalf(msg, dataLength, fd, pipeFds, state)
-	case RpcRestoreDirtyChunksCmdId:
-		m, fileId, fileOffset, r = n.RestoreDirtyChunksTopHalf(msg, dataLength, fd, pipeFds, state)
-	default:
-		log.Errorf("Failed (ignore): unknown rpcId, rpcId=%v", rpcId)
-		noData = true
-		state.completed = true
-		return
-	}
-	if !state.completed {
-		return
-	}
+
 	var ret proto.Message
 	switch rpcId {
 	case RpcUpdateChunkCmdId:
-		ret = n.rpcMgr.UpdateChunkBottomHalf(m, fileId, fileOffset, dataLength, r)
+		ret = n.rpcMgr.UpdateChunkBottomHalf(m, logId, logOffset, dataLength, reply)
 	case RpcRestoreDirtyChunksCmdId:
-		ret = n.rpcMgr.RestoreDirtyChunksBottomHalf(m, fileId, fileOffset, dataLength, r)
+		ret, _ = n.rpcMgr.RestoreDirtyChunksBottomHalf(m, logId, logOffset, dataLength, reply)
 	}
 	if reply := msg.FillExecProtoBufArgs(rpcId, seqNum, ret, 0, true); reply != RaftReplyOk {
 		log.Errorf("Failed: ExecDataRpc, FillExecProtoBufArgs, rpcId=%v, reply=%v", rpcId, reply)
@@ -1413,57 +819,83 @@ func (n *NodeServer) ExecDataRpc(msg RpcMsg, sa common.NodeAddrInet4, fd int, pi
 		state.failed = ReplyToFuseErr(reply)
 		return
 	}
-	//log.Debugf("Success: ExecDataRpc, RpcUpdateChunk, seqNum=%v, optHeaderLength=%v, dataLength=%v", seqNum, h.optHeaderLength, dataLength)
-	return
 }
 
-/**********************************************************
- * methods to start a coordinator for inode/file operations
- **********************************************************/
-
-func (n *NodeServer) CreateCoordinatorId() CoordinatorId {
-	return n.raft.GenerateCoordinatorId()
-}
-
-func (n *NodeServer) CallCoordinator(fn CoordinatorOpBase) (ret CoordinatorRet, reply int32) {
-	id := n.CreateCoordinatorId()
-	var nodeList *RaftNodeList = nil
-	var leader RaftNode
-	for i := 0; i < n.flags.MaxRetry; i++ {
-		l := n.raftGroup.GetNodeListLocal()
-		if nodeList == nil || nodeList.version != l.version {
-			nodeList = l
-			var ok bool
-			leader, ok = fn.GetLeader(n, nodeList)
-			if !ok {
-				log.Errorf("Failed: CallCoordinator (%v), GetLeader", fn.name())
-				return CoordinatorRet{}, RaftReplyNoGroup
-			}
-		}
-		var r RaftBasicReply
-		if leader.nodeId == n.raft.selfId {
-			if r = n.raftGroup.BeginRaftRead(n.raft, nodeList.version); r.reply == RaftReplyOk {
-				ret, r.reply = fn.local(n, id, nodeList)
-			}
-		} else {
-			ret, r = fn.remote(n, leader.addr, id, nodeList.version)
-		}
-		reply = r.reply
-		if r.reply != RaftReplyOk {
-			log.Errorf("Failed: CallCoordinator (%v), i=%v, id=%v, leader=%v, nodeListVer=%v, r=%v", fn.name(), i, id, leader, nodeList.version, r)
-			if r.reply != RaftReplyOk {
-				if newLeader, found := fixupRpcErr(n, leader, r); found {
-					leader = newLeader
-				}
-			}
-			if needRetry(r.reply) {
-				continue
-			}
-		} else if i > 0 {
-			n.raftGroup.UpdateLeader(leader)
-		}
+func (n *NodeServer) ExecDataRpc(msg RpcMsg, sa common.NodeAddrInet4, fd int, pipeFds [2]int, state *ReadRpcMsgState) (noData bool) {
+	payload := msg.GetCmdPayload()
+	rpcId := msg.GetExecProtoBufRpcId(payload)
+	noData = rpcId&DataCmdIdBit == 0
+	if noData {
+		state.completed = true
 		return
 	}
+	var m proto.Message
+	var reply int32
+	var logId LogIdType
+	switch rpcId {
+	case RpcUpdateChunkCmdId:
+		args := &common.UpdateChunkArgs{}
+		if reply = msg.ParseExecProtoBufMessage(args); reply == RaftReplyOk {
+			m = args
+			logId = NewLogIdTypeFromInodeKey(InodeKeyType(args.GetInodeKey()), args.GetOffset(), args.GetChunkSize())
+		}
+	case RpcRestoreDirtyChunksCmdId:
+		args := &common.RestoreDirtyChunksArgs{}
+		if reply = msg.ParseExecProtoBufMessage(args); reply == RaftReplyOk {
+			m = args
+			logId = NewLogIdTypeFromInodeKey(InodeKeyType(args.GetInodeKey()), args.GetOffset(), args.GetChunkSize())
+		}
+	default:
+		log.Errorf("Failed (ignore): ExecDataRpc, unknown rpcId, rpcId=%v", rpcId)
+		noData = true
+		state.completed = true
+		return
+	}
+
+	dataLength, _ := msg.GetOptControlHeader()
+
+	var disk *OnDiskLog
+	if reply != RaftReplyOk {
+		state.failed = ReplyToFuseErr(reply)
+	} else if n.raft.extLogger.IsFreezed(logId) {
+		log.Errorf("Failed: ExecDataRpc, logger is snapshotting, fd=%v, dataLength=%v", fd, dataLength)
+		state.failed = unix.EROFS
+	} else {
+		disk = n.raft.extLogger.GetDiskLog(logId, MaxNrCacheForUpdateChunk, MaxNrWriterForUpdateChunk)
+		if state.optComplete == 1 && state.vec == nil {
+			vec, err := disk.BeginAppendSplice(fd, int64(dataLength))
+			if err != nil {
+				log.Errorf("Failed: ExecDataRpc, BeginAppendSplice, fd=%v, dataLength=%v, err=%v", fd, dataLength, err)
+				state.failed = err
+			} else {
+				state.vec = vec
+			}
+		}
+		if state.vec != nil {
+			err := disk.Splice(state.vec, pipeFds, &state.bufOffForSplice)
+			if err != nil {
+				log.Errorf("Failed: ExecDataRpc, Splice, err=%v", err)
+				state.failed = err
+			} else {
+				state.completed = uint32(state.bufOffForSplice) >= dataLength
+			}
+		}
+	}
+
+	if !state.completed && state.failed == nil {
+		// We still have fragmented messages in the next loop
+		return
+	}
+
+	seqNum := msg.GetExecProtoBufRpcSeqNum(payload)
+	if state.failed != nil {
+		// Note: state.failed != nil will forcefully abort the connection later. we do not need to care about unread network buffers here.
+		// But we ensure notifying the failure before the abort.
+		n.__replyFn(msg, sa, fd, state, rpcId, seqNum, m, disk, state.vec, logId, dataLength)
+	} else {
+		go n.__replyFn(msg, sa, fd, state, rpcId, seqNum, m, disk, state.vec, logId, dataLength)
+	}
+	//log.Debugf("Success: ExecDataRpc, RpcUpdateChunk, seqNum=%v, optHeaderLength=%v, dataLength=%v", seqNum, h.optHeaderLength, dataLength)
 	return
 }
 
@@ -1509,102 +941,102 @@ func (n *NodeServer) SetInodeMetadataKey(_ fuseops.InodeID, name string, value [
 	return nil
 }
 
-func (n *NodeServer) UpdateObjectAttr(attr MetaAttributes, ts int64) (meta *WorkingMeta, err error) {
+func (n *NodeServer) UpdateObjectAttr(inodeKeyType InodeKeyType, mode uint32, ts int64) (meta *WorkingMeta, err error) {
 	coordinatorId := n.raft.GenerateCoordinatorId()
 	txId := coordinatorId.toCoordinatorTxId()
-	ret, r := n.rpcMgr.CallAny(NewUpdateMetaAttrOp(txId, attr, ts), txId, n.flags.RpcTimeoutDuration)
+	ret, r := n.rpcMgr.CallRpc(NewUpdateMetaAttrOp(txId, inodeKeyType, mode, ts).GetCaller(n))
 	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: UpdateObjectAttr, CallAny, attr=%v, reply=%v", attr, r.reply)
+		log.Errorf("Failed: UpdateObjectAttr, CallAny, inodeKeyType=%v, reply=%v", inodeKeyType, r.reply)
 	} else {
-		log.Debugf("Success: UpdateObjectAttr, attr=%v", attr)
+		log.Debugf("Success: UpdateObjectAttr, inodeKeyType=%v", inodeKeyType)
 	}
 	return ret.ext.(*WorkingMeta), ReplyToFuseErr(r.reply)
 }
 
 func (n *NodeServer) TruncateObject(inodeId fuseops.InodeID, size int64) (meta *WorkingMeta, err error) {
 	inodeKey := InodeKeyType(inodeId)
-	ret, reply := n.CallCoordinator(NewCoordinatorTruncateObjectOp(inodeKey, size))
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: TruncateObject, CallCoordinator, inodeKey=%v, size=%v, reply=%v", inodeKey, size, reply)
-	} else {
-		log.Debugf("Success: TruncateObject, inodeKey=%v, size=%v", inodeKey, size)
+	ret, r := n.rpcMgr.CallRpc(NewCoordinatorTruncateObjectOp(n.raft.GenerateCoordinatorId(), inodeKey, size).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		log.Errorf("Failed: TruncateObject, inodeKey=%v, size=%v, r=%v", inodeKey, size, r)
+		return nil, ReplyToFuseErr(r.reply)
 	}
-	return ret.meta, ReplyToFuseErr(reply)
+	log.Debugf("Success: TruncateObject, inodeKey=%v, size=%v", inodeKey, size)
+	return ret.ext.(*CoordinatorRet).meta, ReplyToFuseErr(r.reply)
 }
 
 func (n *NodeServer) UnlinkObject(parentFullPath string, parentId fuseops.InodeID, name string, childKey InodeKeyType) (err error) {
 	// NOTE: childId and childIsDir are required to make coordinator idempotent (== "declare that an inode is now deleted (do not care if the inode exists right now)")
 	parentKey := InodeKeyType(parentId)
-	_, reply := n.CallCoordinator(NewCoordinatorDeleteObjectOp(parentFullPath, parentKey, name, childKey))
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: UnlinkObject, CallCoordinator, parentKey=%v, name=%v, reply=%v", parentKey, name, reply)
+	_, r := n.rpcMgr.CallRpc(NewCoordinatorDeleteObjectOp(n.raft.GenerateCoordinatorId(), parentFullPath, parentKey, name, childKey).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		log.Errorf("Failed: UnlinkObject, CallCoordinator, parentKey=%v, name=%v, r=%v", parentKey, name, r)
 	} else {
 		log.Debugf("Success: UnlinkObject, parentKey=%v, name=%v", parentKey, name)
 	}
-	return ReplyToFuseErr(reply)
+	return ReplyToFuseErr(r.reply)
 }
 
-func (n *NodeServer) HardLinkObject(srcInodeId fuseops.InodeID, srcParent MetaAttributes, dstParentKey string, dstParentInodeId fuseops.InodeID, dstName string, childAttr MetaAttributes) (meta *WorkingMeta, err error) {
+func (n *NodeServer) HardLinkObject(srcInodeId fuseops.InodeID, srcParent InodeKeyType, dstParentKey string, dstParentInodeId fuseops.InodeID, dstName string, childInodeKey InodeKeyType) (meta *WorkingMeta, err error) {
 	// NOTE: childId and childIsDir are required to make coordinator idempotent
 	srcInodeKey := InodeKeyType(srcInodeId)
 	dstParentInodeKey := InodeKeyType(dstParentInodeId)
-	ret, reply := n.CallCoordinator(NewCoordinatorHardLinkOp(srcInodeKey, srcParent, dstParentKey, dstParentInodeKey, dstName, childAttr))
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: HardLinkObject, CallCoordinator, srcInodeId=%v, dstParentInodeId=%v, dstName=%v, reply=%v", srcInodeKey, dstParentInodeKey, dstName, reply)
-	} else {
-		log.Errorf("Success: HardLinkObject, srcInodeId=%v, dstParentInodeId=%v, dstName=%v", srcInodeKey, dstParentInodeKey, dstName)
+	ret, r := n.rpcMgr.CallRpc(NewCoordinatorHardLinkOp(n.raft.GenerateCoordinatorId(), srcInodeKey, srcParent, dstParentKey, dstParentInodeKey, dstName, childInodeKey).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		log.Errorf("Failed: HardLinkObject, CallCoordinator, srcInodeId=%v, dstParentInodeId=%v, dstName=%v, r=%v", srcInodeKey, dstParentInodeKey, dstName, r)
+		return nil, ReplyToFuseErr(r.reply)
 	}
-	return ret.meta, ReplyToFuseErr(reply)
+	log.Errorf("Success: HardLinkObject, srcInodeId=%v, dstParentInodeId=%v, dstName=%v", srcInodeKey, dstParentInodeKey, dstName)
+	return ret.ext.(*CoordinatorRet).meta, ReplyToFuseErr(r.reply)
 }
 
-func (n *NodeServer) RenameObject(srcParentKey string, srcParent MetaAttributes, dstParentKey string, dstParentId fuseops.InodeID, srcName string, dstName string, childAttr MetaAttributes) (err error) {
+func (n *NodeServer) RenameObject(srcParentKey string, srcParent InodeKeyType, dstParentKey string, dstParentId fuseops.InodeID, srcName string, dstName string, childInodeKey InodeKeyType) (err error) {
 	// NOTE: childId and childIsDir are required to make coordinator idempotent
 	dstParentInodeKey := InodeKeyType(dstParentId)
-	_, reply := n.CallCoordinator(NewCoordinatorRenameObjectOp(srcParentKey, srcParent, srcName, dstParentKey, dstParentInodeKey, dstName, childAttr))
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: RenameObject, CallCoordinator, srcParentKey=%v, srcName=%v, dstParentKey=%v, dstName=%v, reply=%v",
-			srcParentKey, srcName, dstParentKey, dstName, reply)
+	_, r := n.rpcMgr.CallRpc(NewCoordinatorRenameObjectOp(n.raft.GenerateCoordinatorId(), srcParentKey, srcParent, srcName, dstParentKey, dstParentInodeKey, dstName, childInodeKey).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		log.Errorf("Failed: RenameObject, CallCoordinator, srcParentKey=%v, srcName=%v, dstParentKey=%v, dstName=%v, r=%v",
+			srcParentKey, srcName, dstParentKey, dstName, r)
 	} else {
 		log.Debugf("Success: RenameObject, srcParentKey=%v, srcName=%v, dstParentKey=%v, dstName=%v",
 			srcParentKey, srcName, dstParentKey, dstName)
 	}
-	return ReplyToFuseErr(reply)
+	return ReplyToFuseErr(r.reply)
 }
 
-func (n *NodeServer) CreateObject(parentKey string, parentAttr MetaAttributes, name string, childAttr MetaAttributes) (meta *WorkingMeta, err error) {
-	ret, reply := n.CallCoordinator(NewCoordinatorCreateObjectOp(parentKey, parentAttr, name, childAttr, n.flags.ChunkSizeBytes, n.flags.DirtyExpireIntervalMs))
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: CreateObject, CallCoordinator, parentKey=%v, name=%v, reply=%v", parentAttr.inodeKey, name, reply)
-	} else {
-		log.Debugf("Success: CreateObject, parentKey=%v, name=%v, inodeKey=%v", parentAttr.inodeKey, name, childAttr.inodeKey)
+func (n *NodeServer) CreateObject(parentKey string, parentInodeKey InodeKeyType, name string, childInodeKey InodeKeyType, mode uint32) (meta *WorkingMeta, err error) {
+	ret, r := n.rpcMgr.CallRpc(NewCoordinatorCreateObjectOp(n.raft.GenerateCoordinatorId(), parentKey, parentInodeKey, name, childInodeKey, mode, n.flags.ChunkSizeBytes, n.flags.DirtyExpireIntervalMs).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		log.Errorf("Failed: CreateObject, CallCoordinator, parentKey=%v, name=%v, r=%v", parentInodeKey, name, r)
+		return nil, ReplyToFuseErr(r.reply)
 	}
-	return ret.meta, ReplyToFuseErr(reply)
+	log.Debugf("Success: CreateObject, parentKey=%v, name=%v, inodeKey=%v", parentInodeKey, name, childInodeKey)
+	return ret.ext.(*CoordinatorRet).meta, ReplyToFuseErr(r.reply)
 }
 
 func (n *NodeServer) FlushObject(inodeKey InodeKeyType, records []*common.UpdateChunkRecordMsg, mTime int64, mode uint32) (meta *WorkingMeta, err error) {
 	begin := time.Now()
-	ret, reply := n.CallCoordinator(NewCoordinatorFlushObjectOp(inodeKey, records, mTime, mode))
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: FlushObject, CallCoordinator, inodeKey=%v, reply=%v", inodeKey, reply)
-	} else {
-		log.Debugf("Success: FlushObject, inodeKey=%v, len(records)=%v, elapsed=%v", inodeKey, len(records), time.Since(begin))
+	ret, r := n.rpcMgr.CallRpc(NewCoordinatorFlushObjectOp(n.raft.GenerateCoordinatorId(), inodeKey, records, mTime, mode).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		log.Errorf("Failed: FlushObject, CallCoordinator, inodeKey=%v, r=%v", inodeKey, r)
+		return nil, ReplyToFuseErr(r.reply)
 	}
-	return ret.meta, ReplyToFuseErr(reply)
+	log.Debugf("Success: FlushObject, inodeKey=%v, len(records)=%v, elapsed=%v", inodeKey, len(records), time.Since(begin))
+	return ret.ext.(*CoordinatorRet).meta, ReplyToFuseErr(r.reply)
 }
 
 func (n *NodeServer) AbortWriteObject(recordMap map[string][]*common.StagingChunkMsg) {
 	// Abort is directly requested from client. This means failures at client loose target TxIds to be aborted.
-	// We cannot reclaim disk space for the non-aborted staging chunks, but no h corruption in the filesystem.
-	// Note that client roles are taken by some participant servers in a cluster, so, our end-users, filesystem
+	// We cannot reclaim disk space for the non-aborted staging chunks, but no h corruption in the FS.
+	// Note that client roles are taken by some participant servers in a cluster, so, our end-users, FS
 	// applications in this case, cannot intentionally cause disk leakages by exploiting this procedure.
-	id := n.CreateCoordinatorId()
+	id := n.raft.GenerateCoordinatorId()
 	txId := id.toTxId(1)
 	for groupId, stags := range recordMap {
 		txIds := make([]*common.TxIdMsg, 0)
 		for _, stag := range stags {
 			txIds = append(txIds, stag.GetTxId())
 		}
-		ret := n.rpcMgr.CallRpcAnyNoFail(NewAbortParticipantOp(txId, txIds, groupId), txId, n.flags.RpcTimeoutDuration)
+		ret, _ := n.rpcMgr.CallRpc(NewAbortParticipantOp(txId, txIds, groupId, false).GetCaller(n))
 		txId = txId.GetNext()
 		if ret.unlock != nil {
 			ret.unlock(n)
@@ -1614,36 +1046,18 @@ func (n *NodeServer) AbortWriteObject(recordMap map[string][]*common.StagingChun
 
 func (n *NodeServer) PersistObject(inodeId fuseops.InodeID) (meta *WorkingMeta, err error) {
 	inodeKey := InodeKeyType(inodeId)
-	ret, reply := n.CallCoordinator(NewCoordinatorPersistOp(inodeKey, 1000))
-	if reply != RaftReplyOk {
-		log.Errorf("Failed: PersistObject, inodeKey=%v, reply=%v", inodeKey, reply)
-	} else {
-		log.Debugf("Success: PersistObject, inodeKey=%v", inodeKey)
+	ret, r := n.rpcMgr.CallRpc(NewCoordinatorPersistOp(n.raft.GenerateCoordinatorId(), inodeKey, 1000).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		log.Errorf("Failed: PersistObject, inodeKey=%v, r=%v", inodeKey, r)
+		return nil, ReplyToFuseErr(r.reply)
 	}
-	return ret.meta, ReplyToFuseErr(reply)
+	log.Debugf("Success: PersistObject, inodeKey=%v", inodeKey)
+	return ret.ext.(*CoordinatorRet).meta, ReplyToFuseErr(r.reply)
 }
 
 /**************************************************
  * methods to migrate data at node addition/removal
  **************************************************/
-
-func (n *NodeServer) RestoreDirtyChunksTopHalf(msg RpcMsg, dataLength uint32, fd int, pipeFds [2]int, state *ReadRpcMsgState) (m proto.Message, fileId FileIdType, fileOffset int64, r RaftBasicReply) {
-	args := &common.RestoreDirtyChunksArgs{}
-	if reply := msg.ParseExecProtoBufMessage(args); reply != RaftReplyOk {
-		log.Errorf("Failed: RestoreDirtyChunksTopHalf, ParseExecProtoBufMessage, reply=%v", reply)
-		r = RaftBasicReply{reply: reply}
-		state.completed = true
-		return
-	}
-	r = n.raft.SyncBeforeClientQuery()
-	if r.reply != RaftReplyOk {
-		log.Errorf("Failed: RestoreDirtyChunksTopHalf, SyncBeforeClientQuery, r=%v", r)
-		state.completed = true
-		return
-	}
-	fileId, _, r.reply = n.SpliceChunk(fd, pipeFds, state, InodeKeyType(args.GetInodeKey()), dataLength, args.GetOffset(), args.GetChunkSize())
-	return args, fileId, state.fileOffsetForSplice, r
-}
 
 func (n *NodeServer) sendDirtyChunkAny(migrationId MigrationId, nodeListVer uint64, target RaftNode, inodeKey InodeKeyType, offset int64, version uint32, chunkSize int64, objectSize int64, rpcChunkSize int64) int32 {
 	chunk := n.inodeMgr.GetChunk(inodeKey, offset, chunkSize)
@@ -1662,10 +1076,10 @@ func (n *NodeServer) sendDirtyChunkAny(migrationId MigrationId, nodeListVer uint
 			length = chunkSize
 		}
 		reader := working.GetReader(chunkSize, objectSize, offset+count, n.inodeMgr, true)
-		bs, c, err := reader.GetBufferDirect(int(length))
+		bs, c, err := reader.GetBufferZeroCopy(int(length))
 		reader.Close()
 		if err != nil {
-			log.Errorf("Failed: sendDirtyChunkAny, GetBufferDirect, err=%v", err)
+			log.Errorf("Failed: sendDirtyChunkAny, GetBufferZeroCopy, err=%v", err)
 			chunk.lock.RUnlock()
 			for _, slice := range slices {
 				slice.SetEvictable()
@@ -1682,14 +1096,13 @@ func (n *NodeServer) sendDirtyChunkAny(migrationId MigrationId, nodeListVer uint
 	for _, slice := range slices {
 		bufs = append(bufs, slice.Buf)
 	}
-	fn := NewRestoreDirtyChunkOp(migrationId, target, inodeKey, chunkSize, offset, objectSize, working.chunkVer, bufs)
-	ok := n.rpcMgr.CallRemote(fn, n.flags.ChunkRpcTimeoutDuration)
+	_, r := n.rpcMgr.CallRpc(NewRestoreDirtyChunkOp(migrationId, target, inodeKey, chunkSize, offset, objectSize, working.chunkVer, bufs).GetCaller(n))
 	for _, slice := range slices {
 		slice.SetEvictable()
 	}
-	if !ok {
+	if r.reply != RaftReplyOk {
 		log.Error("Failed: sendDirtyChunkAny, CallRemote(RestoreDirtyChunksBottomHalf)")
-		return RaftReplyFail
+		return r.reply
 	}
 	log.Debugf("Success: sendDirtyChunkAny, inodeKey=%v, offset=%v, chunkVer=%v, count=%v", inodeKey, offset, working.chunkVer, count)
 	return RaftReplyOk
@@ -1850,6 +1263,14 @@ func GetServerConfig(args *common.ObjcacheCmdlineArgs, timeout time.Duration) (c
 	}
 }
 
+func (n *NodeServer) GetApiPort(leader RaftNode) (apiPort int, reply int32) {
+	ret, r := n.rpcMgr.CallRpc(NewGetApiIpAndPortOp(leader).GetCaller(n))
+	if r.reply != RaftReplyOk {
+		return -1, r.reply
+	}
+	return ret.ext.(int), RaftReplyOk
+}
+
 func GetAddrInet4FromString(headWorkerAddr string, headWorkerPort int) (common.NodeAddrInet4, error) {
 	ip := net.ParseIP(headWorkerAddr)
 	if ip == nil {
@@ -1896,18 +1317,20 @@ func (n *NodeServer) RequestJoinLocal(headWorkerAddr string, headWorkerPort int)
 		log.Infof("RequestJoinLocal, selfAddr==randomAddr=%v:%v, ignore this request.", n.selfNode.addr, n.args.ApiPort)
 		return nil
 	}
-	n.inodeMgr.SuspendNode()
-	defer n.inodeMgr.ResumeNode()
 	trackerNode := RaftNode{addr: randomAddr}
 	var r RaftBasicReply
 	var nodeListVer uint64
-	id := n.CreateCoordinatorId()
+	id := n.raft.GenerateCoordinatorId()
 	for {
+		if atomic.LoadInt32(&n.shutdown) != 0 {
+			log.Errorf("Failed: RequestJoin, shutdown is requested")
+			return unix.EIO
+		}
 		nextNode, nodeGroups, nlv, reply := n.getTrackerNodeRemote(trackerNode.addr)
 		if reply != RaftReplyOk {
 			log.Errorf("Failed: RequestJoinLocal, getTrackerNodeRemote, err=%v", reply)
 			if reply == RaftReplyNotLeader {
-				port, reply2 := CallGetApiPort(n, nextNode.addr)
+				port, reply2 := n.GetApiPort(nextNode)
 				if reply2 == RaftReplyOk {
 					nextNode.addr.Port = port
 					trackerNode = nextNode
@@ -1926,18 +1349,21 @@ func (n *NodeServer) RequestJoinLocal(headWorkerAddr string, headWorkerPort int)
 		for _, ng := range nodeGroups {
 			groupAddr[ng.GetGroupId()] = true
 		}
-		fn := NewCoordinatorUpdateNodeListOp(true, n.selfNode, groupAddr, nodeListVer)
+		fn := NewCoordinatorUpdateNodeListOp(id, nextNode, true, n.selfNode, groupAddr, nodeListVer)
 		if nextNode.nodeId == n.raft.selfId {
 			if r = n.raftGroup.BeginRaftRead(n.raft, nodeListVer); r.reply == RaftReplyOk {
-				_, r.reply = fn.local(n, id, n.raftGroup.GetNodeListLocal())
+				tm := NewTxIdMgr(fn.GetTxId())
+				if _, r.reply = fn.local(n, tm, n.raftGroup.GetNodeListLocal()); r.reply != RaftReplyOk {
+					n.rpcMgr.AbortAll(tm, n.flags.CoordinatorTimeoutDuration, true)
+				}
 			}
 		} else {
-			_, r = fn.remote(n, nextNode.addr, id, nodeListVer)
+			_, r = fn.remote(n, nextNode.addr, nodeListVer)
 		}
 		if r.reply != RaftReplyOk {
 			log.Errorf("Failed: RequestJoinLocal, NewCoordinatorUpdateNodeListOp, nextNode=%v, reply=%v", nextNode, r.reply)
 			if newTracker, found := fixupRpcErr(n, nextNode, r); found {
-				port, reply2 := CallGetApiPort(n, newTracker.addr)
+				port, reply2 := n.GetApiPort(newTracker)
 				if reply2 == RaftReplyOk {
 					newTracker.addr.Port = port
 					trackerNode = newTracker
@@ -1959,7 +1385,8 @@ func (n *NodeServer) RequestJoinLocal(headWorkerAddr string, headWorkerPort int)
 
 func (n *NodeServer) UpdateNodeListAsClient() error {
 	if !n.args.ClientMode {
-		log.Fatalf("UpdateNodeListAsClient is called but the node is not client mode")
+		log.Errorf("Failed: UpdateNodeListAsClient, the node is not client mode")
+		return unix.EINVAL
 	}
 	randomAddr, err := GetAddrInet4FromString(n.args.HeadWorkerIp, n.args.HeadWorkerPort)
 	if err != nil {
@@ -1967,14 +1394,14 @@ func (n *NodeServer) UpdateNodeListAsClient() error {
 		return err
 	}
 	for i := 0; i < n.flags.MaxRetry; i++ {
-		n.inodeMgr.SuspendNode()
+		n.LockNode()
 		nextNode, nodeGroups, nodeListVer, reply := n.getTrackerNodeRemote(randomAddr)
 		if reply != RaftReplyOk {
-			n.inodeMgr.ResumeNode()
+			n.UnlockNode()
 			log.Errorf("Failed: UpdateNodeListAsClient, getTrackerNodeRemote, addr=%v, i=%v, err=%v", randomAddr, i, reply)
 			if reply == RaftReplyNotLeader {
 				// we retry only if the leader has changed
-				port, reply2 := CallGetApiPort(n, nextNode.addr)
+				port, reply2 := n.GetApiPort(nextNode)
 				if reply2 == RaftReplyOk {
 					nextNode.addr.Port = port
 					randomAddr = nextNode.addr
@@ -1987,7 +1414,7 @@ func (n *NodeServer) UpdateNodeListAsClient() error {
 			return ReplyToFuseErr(reply)
 		}
 		n.raftGroup.SetNodeListDirect(nodeGroups, nodeListVer)
-		n.inodeMgr.ResumeNode()
+		n.UnlockNode()
 		log.Infof("Success: UpdateNodeListAsClient, tracker=%v, len(nodeGroups)=%v, nodeListVer=%v", randomAddr, len(nodeGroups), nodeListVer)
 		return nil
 	}
@@ -2012,7 +1439,7 @@ func (n *NodeServer) GetApiIpAndPortRemote(node RaftNode) (apiAddr string, apiPo
 	}
 	for {
 		msg := &common.GetApiIpAndPortRet{}
-		reply := n.rpcClient.CallObjcacheRpc(RpcGetApiIpAndPortCmdId, &api.Void{}, node.addr, n.flags.RpcTimeoutDuration, n.raft.files, nil, nil, msg)
+		reply := n.rpcClient.CallObjcacheRpc(RpcGetApiIpAndPortCmdId, &api.Void{}, node.addr, n.flags.RpcTimeoutDuration, n.raft.extLogger, nil, nil, msg)
 		if reply != RaftReplyOk {
 			log.Errorf("Failed: GetApiIpAndPortRemote, CallObjcacheRpc, node=%v, reply=%v", node, reply)
 			return "", 0, reply
@@ -2041,17 +1468,16 @@ func (n *NodeServer) RequestRemoveNode(_ context.Context, args *api.RequestLeave
 		_ = unix.Kill(unix.Getpid(), unix.SIGTERM)
 		return &api.ApiRet{Status: RaftReplyOk}, nil
 	}
-	var nodeListReply *common.MembershipListMsg
 	var r RaftBasicReply
 	node := RaftNode{addr: common.NodeAddrInet4{Port: int(args.GetPort()), Addr: [4]byte{}}, nodeId: args.GetNodeId()}
 	copy(node.addr.Addr[:], args.GetIp())
-	id := n.CreateCoordinatorId()
+	id := n.raft.GenerateCoordinatorId()
 	for {
 		nextNode, nodeGroups, nodeListVer, reply := n.getTrackerNodeRemote(trackerNode.addr)
 		if reply != RaftReplyOk {
 			log.Errorf("Failed: RequestRemoveNode, getTrackerNodeRemote, err=%v", reply)
 			if reply == RaftReplyNotLeader {
-				port, reply2 := CallGetApiPort(n, nextNode.addr)
+				port, reply2 := n.GetApiPort(nextNode)
 				if reply2 == RaftReplyOk {
 					nextNode.addr.Port = port
 					trackerNode = nextNode
@@ -2077,18 +1503,21 @@ func (n *NodeServer) RequestRemoveNode(_ context.Context, args *api.RequestLeave
 			log.Infof("Success: RequestRemoveNode, not found: leavingAddr=%v", leavingAddr)
 			return &api.ApiRet{Status: RaftReplyOk}, nil
 		}
-		fn := NewCoordinatorUpdateNodeListOp(false, node, groupAddr, nodeListVer)
+		fn := NewCoordinatorUpdateNodeListOp(id, nextNode, false, node, groupAddr, nodeListVer)
 		if nextNode.nodeId == n.raft.selfId {
 			if r = n.raftGroup.BeginRaftRead(n.raft, nodeListVer); r.reply == RaftReplyOk {
-				nodeListReply, r.reply = fn.local(n, id, n.raftGroup.GetNodeListLocal())
+				tm := NewTxIdMgr(fn.GetTxId())
+				if _, r.reply = fn.local(n, tm, n.raftGroup.GetNodeListLocal()); r.reply != RaftReplyOk {
+					n.rpcMgr.AbortAll(tm, n.flags.CoordinatorTimeoutDuration, true)
+				}
 			}
 		} else {
-			nodeListReply, r = fn.remote(n, nextNode.addr, id, nodeListVer)
+			_, r = fn.remote(n, nextNode.addr, nodeListVer)
 		}
 		if r.reply != RaftReplyOk {
 			log.Errorf("Failed: RequestRemoveNode, NewCoordinatorUpdateNodeListOp, leavingNode=%v, nextNode=%v, r=%v", node, nextNode, r)
 			if newTracker, ok := fixupRpcErr(n, nextNode, r); ok {
-				port, reply2 := CallGetApiPort(n, newTracker.addr)
+				port, reply2 := n.GetApiPort(newTracker)
 				if reply2 == RaftReplyOk {
 					newTracker.addr.Port = port
 					trackerNode = newTracker
@@ -2104,40 +1533,30 @@ func (n *NodeServer) RequestRemoveNode(_ context.Context, args *api.RequestLeave
 		trackerNode = nextNode
 		break
 	}
-	log.Infof("Success: RequestRemoveNode, leavingNode=%v, trackerNode=%v, nodeListReply=%v", node, trackerNode, nodeListReply)
+	log.Infof("Success: RequestRemoveNode, leavingNode=%v, trackerNode=%v", node, trackerNode)
 	return &api.ApiRet{Status: RaftReplyOk}, nil
 }
 
 func (n *NodeServer) sendDirtyMetasForNodeJoin(migrationId MigrationId, nodeList *RaftNodeList, newRing *hashring.HashRing, target RaftNode) (reply int32) {
-	keys := n.dirtyMgr.GetDirtyMetasForNodeJoin(migrationId, nodeList, newRing, n.raftGroup.selfGroup, target.groupId)
-	dirKeys := n.dirtyMgr.GetDirMetasForNodeJoin(n.inodeMgr.GetAllDirectoryMeta(), migrationId, nodeList, newRing, n.raftGroup.selfGroup, target.groupId)
-	if len(keys)+len(dirKeys) > 0 {
-		metas, files := n.inodeMgr.GetAllMeta(keys)
-		dirMetas, dirFiles := n.inodeMgr.GetAllMeta(dirKeys)
-		ok := n.rpcMgr.CallRemote(NewRestoreDirtyMetaOp(migrationId, metas, files, dirMetas, dirFiles, target), n.flags.ChunkRpcTimeoutDuration)
-		if !ok {
-			log.Errorf("Failed: sendDirtyMetasForNodeJoin, CallRemote, target=%v, len(keys)=%v", target, len(keys))
-			return RaftReplyFail
+	dirtyInodes := n.dirtyMgr.GetDirtyMetasForNodeJoin(migrationId, nodeList, newRing, n.raftGroup.selfGroup, target.groupId)
+	snapshot := n.inodeMgr.GetMetaForNodeJoin(migrationId, n.raftGroup.selfGroup, target.groupId, nodeList, newRing, dirtyInodes)
+	if len(snapshot.metas)+len(snapshot.dirents)+len(snapshot.files) > 0 {
+		_, r := n.rpcMgr.CallRpc(NewRestoreDirtyMetaOp(snapshot, target).GetCaller(n))
+		if r.reply != RaftReplyOk {
+			log.Errorf("Failed: sendDirtyMetasForNodeJoin, CallRemote, target=%v, len(dirtyInodes)=%v, r=%v", target, len(dirtyInodes), r)
+			return r.reply
 		}
-		n.dirtyMgr.RecordMigratedRemoveMetas(migrationId, keys...)
-		n.dirtyMgr.RecordMigratedRemoveDirMetas(migrationId, dirKeys...)
-		for _, meta := range metas {
-			log.Infof("Success: sendDirtyMetasForNodeJoin, metadata map: inodeKey=%v, target=%v", meta.GetInodeKey(), target)
-		}
-		for _, file := range files {
-			log.Infof("Success: sendDirtyMetasForNodeJoin, inode to key map: inodeKey=%v, key=%v, target=%v", file.GetInodeKey(), file.GetFilePath(), target)
-		}
-		for _, meta := range dirMetas {
-			log.Infof("Success: sendDirtyMetasForNodeJoin, metadata map (Dir): inodeKey=%v, target=%v", meta.GetInodeKey(), target)
-		}
-		for _, file := range dirFiles {
-			log.Infof("Success: sendDirtyMetasForNodeJoin, inode to key map (Dir): inodeKey=%v, key=%v, target=%v", file.GetInodeKey(), file.GetFilePath(), target)
+		if reply = n.raft.AppendExtendedLogEntry(NewRecordMigratedRemoveMetaCommand(migrationId, dirtyInodes, snapshot.dirents)); reply != RaftReplyOk {
+			log.Errorf("Failed: sendDirtyMetasForNodeJoin, AppendExtendedLogEntry, migrationId=%v, len(dirInodes)=%v, reply=%v",
+				migrationId, len(dirtyInodes), reply)
+			return reply
 		}
 	}
 	return RaftReplyOk
 }
 
 func (n *NodeServer) sendDirtyChunksForNodeJoin(migrationId MigrationId, nodeList *RaftNodeList, newRing *hashring.HashRing, target RaftNode) (reply int32) {
+	chunks := make([]*common.ChunkRemoveDirtyMsg, 0)
 	for inodeKey, chunkInfo := range n.dirtyMgr.GetDirtyChunkForNodeJoin(migrationId, nodeList, newRing, n.raftGroup.selfGroup, target.groupId) {
 		for offset, version := range chunkInfo.OffsetVersions {
 			reply = n.sendDirtyChunkAny(migrationId, nodeList.version, target, inodeKey, offset, version, chunkInfo.chunkSize, chunkInfo.objectSize, n.flags.RpcChunkSizeBytes)
@@ -2145,8 +1564,13 @@ func (n *NodeServer) sendDirtyChunksForNodeJoin(migrationId MigrationId, nodeLis
 				log.Errorf("Failed: sendDirtyChunkAny, inodeKey=%v, offset=%v, version=%v, reply=%v", inodeKey, offset, version, reply)
 				return reply
 			}
-			n.dirtyMgr.RecordMigratedRemoveChunks(migrationId, inodeKey, offset, version)
+			chunks = append(chunks, &common.ChunkRemoveDirtyMsg{InodeKey: uint64(inodeKey), Offset: offset, Version: version})
 		}
+	}
+	if reply = n.raft.AppendExtendedLogEntry(NewRecordMigratedRemoveChunkCommand(migrationId, chunks)); reply != RaftReplyOk {
+		log.Errorf("Failed: sendDirtyMetasForNodeJoin, AppendExtendedLogEntry, migrationId=%v, len(chunks)=%v, reply=%v",
+			migrationId, len(chunks), reply)
+		return reply
 	}
 	return RaftReplyOk
 }
@@ -2156,54 +1580,30 @@ func (n *NodeServer) sendDirtyChunksForNodeJoin(migrationId MigrationId, nodeLis
  *************************************/
 
 func (n *NodeServer) sendDirtyMetasForNodeLeave(migrationId MigrationId, nodeList *RaftNodeList) (reply int32) {
-	for groupId, inodeKeys := range n.dirtyMgr.GetDirtyMetaForNodeLeave(nodeList) {
+	dirtyInodes, dirtyMetas := n.dirtyMgr.GetDirtyMetaForNodeLeave(nodeList)
+	snapshots := n.inodeMgr.GetMetaForNodeLeave(migrationId, nodeList, dirtyMetas)
+	for groupId, snapshot := range snapshots {
 		leader, ok := n.raftGroup.GetGroupLeader(groupId, nodeList)
 		if !ok {
 			log.Errorf("Failed: sendDirtyMetasForNodeLeave, GetLeaderNode, groupId=%v", groupId)
 			return RaftReplyNoGroup
 		}
-		metas, files := n.inodeMgr.GetAllMeta(inodeKeys)
-		ok = n.rpcMgr.CallRemote(NewRestoreDirtyMetaOp(migrationId, metas, files, nil, nil, leader), n.flags.ChunkRpcTimeoutDuration)
-		if !ok {
-			log.Errorf("Failed: sendDirtyMetasForNodeLeave, CallRemote, target=%v, len(keys)=%v", leader, len(inodeKeys))
-			return RaftReplyFail
-		}
-		n.dirtyMgr.RecordMigratedRemoveMetas(migrationId, inodeKeys...)
-		for _, meta := range metas {
-			log.Infof("Success: sendDirtyMetasForNodeLeave, node=%v, inodeKey=%v", leader, meta.GetInodeKey())
-		}
-		for _, file := range files {
-			log.Infof("Success: sendDirtyMetasForNodeLeave, node=%v, inodeKey=%v, key=%v", leader, file.GetInodeKey(), file.GetFilePath())
+		_, r := n.rpcMgr.CallRpc(NewRestoreDirtyMetaOp(snapshot, leader).GetCaller(n))
+		if r.reply != RaftReplyOk {
+			log.Errorf("Failed: sendDirtyMetasForNodeLeave, CallRemote, target=%v, len(dirtyInodes)=%v, r=%v", leader, len(dirtyInodes), r)
+			return r.reply
 		}
 	}
-	return RaftReplyOk
-}
-
-func (n *NodeServer) sendDirMetasForNodeLeave(migrationId MigrationId, nodeList *RaftNodeList) (reply int32) {
-	for groupId, inodeKeys := range n.dirtyMgr.GetDirMetaForNodeLeave(n.inodeMgr.GetAllDirectoryMeta(), nodeList) {
-		leader, ok := n.raftGroup.GetGroupLeader(groupId, nodeList)
-		if !ok {
-			log.Errorf("Failed: sendDirMetasForNodeLeave, GetLeaderNode, groupId=%v", groupId)
-			return RaftReplyNoGroup
-		}
-		metas, files := n.inodeMgr.GetAllMeta(inodeKeys)
-		ok = n.rpcMgr.CallRemote(NewRestoreDirtyMetaOp(migrationId, nil, nil, metas, files, leader), n.flags.ChunkRpcTimeoutDuration)
-		if !ok {
-			log.Errorf("Failed: sendDirMetasForNodeLeave, CallRemote, target=%v, len(keys)=%v", leader, len(inodeKeys))
-			return RaftReplyFail
-		}
-		n.dirtyMgr.RecordMigratedRemoveMetas(migrationId, inodeKeys...)
-		for _, meta := range metas {
-			log.Infof("Success: sendDirMetasForNodeLeave, node=%v, inodeKey=%v", leader, meta.GetInodeKey())
-		}
-		for _, file := range files {
-			log.Infof("Success: sendDirMetasForNodeLeave, node=%v, inodeKey=%v, key=%v", leader, file.GetInodeKey(), file.GetFilePath())
-		}
+	if reply = n.raft.AppendExtendedLogEntry(NewRecordMigratedRemoveMetaCommand(migrationId, dirtyInodes, nil)); reply != RaftReplyOk {
+		log.Errorf("Failed: sendDirtyMetasForNodeJoin, AppendExtendedLogEntry, migrationId=%v, len(dirtyInodes)=%v, reply=%v",
+			migrationId, len(dirtyInodes), reply)
+		return reply
 	}
 	return RaftReplyOk
 }
 
 func (n *NodeServer) sendDirtyChunksForNodeLeave(migrationId MigrationId, nodeList *RaftNodeList) (reply int32) {
+	chunks := make([]*common.ChunkRemoveDirtyMsg, 0)
 	for inodeKey, chunkInfo := range n.dirtyMgr.GetDirtyChunkAll() {
 		for offset, version := range chunkInfo.OffsetVersions {
 			groupId, ok := GetGroupForChunk(nodeList.ring, inodeKey, offset, chunkInfo.chunkSize)
@@ -2221,20 +1621,22 @@ func (n *NodeServer) sendDirtyChunksForNodeLeave(migrationId MigrationId, nodeLi
 				log.Errorf("Failed: sendDirtyChunksForNodeLeave, sendDirtyChunkAny, leader=%v, inodeKey=%v, offset=%v, r=%v", leader, inodeKey, offset, reply)
 				return reply
 			}
-			n.dirtyMgr.RecordMigratedRemoveChunks(migrationId, inodeKey, offset, version)
-			log.Infof("Success: sendDirtyChunkAny, node=%v, migrationId=%v, inodeKey=%v, offset=%v, version=%v", leader, migrationId, inodeKey, offset, version)
+			chunks = append(chunks, &common.ChunkRemoveDirtyMsg{InodeKey: uint64(inodeKey), Offset: offset, Version: version})
 		}
 	}
-	return RaftReplyOk
+	if reply = n.raft.AppendExtendedLogEntry(NewRecordMigratedRemoveChunkCommand(migrationId, chunks)); reply != RaftReplyOk {
+		log.Errorf("Failed: sendDirtyMetasForNodeJoin, AppendExtendedLogEntry, migrationId=%v, len(msg.RemoveDirtyChunks)=%v, reply=%v",
+			migrationId, len(chunks), reply)
+	}
+	return reply
 }
 
 func (n *NodeServer) RequestLeave() int32 {
-	log.Infof("RequestLeave: Make this Node readonly")
-	n.inodeMgr.SuspendNode()
-	id := n.CreateCoordinatorId()
+	id := n.raft.GenerateCoordinatorId()
 	var nodeList *RaftNodeList = nil
 	var trackerNode RaftNode
-	for i := 0; i < n.flags.MaxRetry; i++ {
+	for i := 0; ; i++ {
+		n.WaitNodeUnlocked()
 		l := n.raftGroup.GetNodeListLocal()
 		if nodeList == nil || nodeList.version != l.version {
 			var reply int32
@@ -2248,36 +1650,19 @@ func (n *NodeServer) RequestLeave() int32 {
 		for gId := range nodeList.groupNode {
 			groupAddr[gId] = true
 		}
-		fn := NewCoordinatorUpdateNodeListOp(false, n.selfNode, groupAddr, nodeList.version)
-		var r RaftBasicReply
-		var nodeListReply *common.MembershipListMsg
-		if trackerNode.nodeId == n.raft.selfId {
-			if r = n.raftGroup.BeginRaftRead(n.raft, nodeList.version); r.reply == RaftReplyOk {
-				nodeListReply, r.reply = fn.local(n, id, n.raftGroup.GetNodeListLocal())
-			}
-		} else {
-			nodeListReply, r = fn.remote(n, trackerNode.addr, id, nodeList.version)
-		}
+		ret, r := n.rpcMgr.CallRpcOneShot(NewCoordinatorUpdateNodeListOp(id, trackerNode, false, n.selfNode, groupAddr, nodeList.version).GetCaller(n), nodeList)
 		if r.reply != RaftReplyOk {
-			log.Errorf("Failed: NodeServer.RequestLeave, NewCoordinatorUpdateNodeListOp, trackerNode=%v, nodeListVer=%v, reply=%v", trackerNode, nodeList.version, r.reply)
-			if newTracker, found := fixupRpcErr(n, trackerNode, r); found {
-				trackerNode = newTracker
-			}
+			log.Errorf("Failed: NodeServer.RequestLeave, NewCoordinatorUpdateNodeListOp, trackerNode=%v, nodeListVer=%v, i=%v, reply=%v", trackerNode, nodeList.version, i, r.reply)
 			if needRetry(r.reply) {
 				continue
 			}
 			return r.reply
-		} // else {
-		//n.raftGroup.UpdateLeader(trackerNode) // we don't need leader info now
-		//}
-		// delete all nodes/groups this node maintains
-		txId := n.raft.GenerateCoordinatorId()
-		txId2 := txId.toCoordinatorTxId()
-		if reply := n.raft.AppendExtendedLogEntry(AppendEntryUpdateNodeListLocalCmdId, &common.UpdateNodeListMsg{Nodes: nodeListReply, TxId: txId2.toMsg(), IsAdd: false}); reply != RaftReplyOk {
-			log.Errorf("Failed (ignore): RequestLeave, AppendExtendedLogEntry, nodeListReply=%v, reply=%v", nodeListReply, reply)
+		} else if i > 0 {
+			n.raftGroup.UpdateLeader(ret.node)
 		}
+		// delete all nodes/groups this node maintains
 		if reply := n.raft.RemoveAllServerIds(); reply != RaftReplyOk {
-			log.Errorf("Failed (ignore): RequestLeave, Raft.RemoveServerLocal, server=%v, reply=%v", n.raft.selfId, reply)
+			log.Errorf("Failed (ignore): RequestLeave, Raft.RemoveAllServerIds, server=%v, reply=%v", n.raft.selfId, reply)
 		}
 		log.Infof("Success: RequestLeave, selfAddr=%v, trackerNode=%v", n.selfNode.addr, trackerNode)
 		break
@@ -2294,9 +1679,9 @@ func (n *NodeServer) PersistAllDirty() {
 	log.Infof("PersistAllDirty: Flush dirty metadata on this Node")
 	dirtyKeys := n.dirtyMgr.CopyAllPrimaryDirtyMeta()
 	for _, inodeKey := range dirtyKeys {
-		_, reply := n.CallCoordinator(NewCoordinatorPersistOp(inodeKey, 1000))
-		if reply != RaftReplyOk {
-			log.Errorf("Failed: PersistAllDirty, persistMetaAny, inodeKey=%v, reply=%v", inodeKey, reply)
+		_, r := n.rpcMgr.CallRpc(NewCoordinatorPersistOp(n.raft.GenerateCoordinatorId(), inodeKey, 1000).GetCaller(n))
+		if r.reply != RaftReplyOk {
+			log.Errorf("Failed: PersistAllDirty, persistMetaAny, inodeKey=%v, r=%v", inodeKey, r)
 		} else {
 			log.Infof("Success: PersistAllDirty, persistMetaAny, inodeKey=%v", inodeKey)
 		}
@@ -2304,9 +1689,9 @@ func (n *NodeServer) PersistAllDirty() {
 	log.Infof("PersistAllDirty: Flush deleted keys on this Node")
 	deletedKeys := n.dirtyMgr.CopyAllPrimaryDeletedKeys()
 	for key, inodeKey := range deletedKeys {
-		_, reply := n.CallCoordinator(NewCoordinatorDeletePersistOp(key, inodeKey, 1000))
-		if reply != RaftReplyOk {
-			log.Errorf("Failed: PersistAllDirty, persistDeleteMetaAny, key=%v, inodeKey=%v, reply=%v", key, inodeKey, reply)
+		_, r := n.rpcMgr.CallRpc(NewCoordinatorDeletePersistOp(n.raft.GenerateCoordinatorId(), key, inodeKey, 1000).GetCaller(n))
+		if r.reply != RaftReplyOk {
+			log.Errorf("Failed: PersistAllDirty, persistDeleteMetaAny, key=%v, inodeKey=%v, r=%v", key, inodeKey, r)
 		} else {
 			log.Infof("Success: PersistAllDirty, persistDeleteMetaAny, key=%v, inodeKey=%v", key, inodeKey)
 		}
@@ -2317,15 +1702,15 @@ func (n *NodeServer) PersistAllDirty() {
 	dirtyKeys = n.dirtyMgr.GetLikelyDirtyChunkInodeIds()
 	falsePositives := make([]uint64, 0)
 	for _, inodeKey := range dirtyKeys {
-		ret, reply := n.CallCoordinator(NewCoordinatorPersistOp(inodeKey, 1000))
-		if reply == RaftReplyOk {
-			if ret.extReply == ObjCacheIsNotDirty {
+		ret, r := n.rpcMgr.CallRpc(NewCoordinatorPersistOp(n.raft.GenerateCoordinatorId(), inodeKey, 1000).GetCaller(n))
+		if r.reply == RaftReplyOk {
+			if ret.ext.(*CoordinatorRet).extReply == ObjCacheIsNotDirty {
 				falsePositives = append(falsePositives, uint64(inodeKey))
 			} else {
 				log.Infof("Success: PersistAllDirty, persistMetaAny, inodeKey=%v", inodeKey)
 			}
 		} else {
-			log.Warnf("Failed: PersistAllDirty, persistMetaAny, inodeKey=%v, reply=%v", inodeKey, reply)
+			log.Warnf("Failed: PersistAllDirty, persistMetaAny, inodeKey=%v, reply=%v", inodeKey, r.reply)
 		}
 	}
 	if reply := n.dirtyMgr.AppendRemoveNonDirtyChunksLog(n.raft, falsePositives); reply != RaftReplyOk {
@@ -2342,10 +1727,13 @@ func (n *NodeServer) Shutdown(deleteStateFile bool) bool {
 	}
 	log.Infof("=========== shutdown requested ===========")
 	log.Infof("Shutdown: Check and wait if this Node is joining")
-	n.inodeMgr.waitNodeResume()
+	n.WaitNodeUnlocked()
 	if !n.args.ClientMode {
 		n.PersistAllDirty()
-		n.RequestLeave()
+		if reply := n.RequestLeave(); reply != RaftReplyOk {
+			log.Errorf("Failed: Shutdown, RequestLeave, reply=%v", reply)
+			return false
+		}
 		n.dropChunkMetaCache()
 		n.raft.Shutdown()
 	}
@@ -2457,7 +1845,7 @@ func (n *NodeServer) CoreDump(_ context.Context, _ *api.Void) (*api.Void, error)
 }
 
 func (n *NodeServer) Rejuvenate(_ context.Context, _ *api.Void) (*api.ApiRet, error) {
-	if serverInstance == nil {
+	if n == nil {
 		log.Errorf("Failed: Rejuvenate, not started yet")
 		return &api.ApiRet{Status: ErrnoToReply(unix.EBUSY)}, nil
 	}
@@ -2488,7 +1876,7 @@ func (n *NodeServer) Rejuvenate(_ context.Context, _ *api.Void) (*api.ApiRet, er
 		}
 	}
 	if n.fs != nil {
-		if err := n.fs.Reset(); err != nil {
+		if err := n.fs.Reset(false); err != nil {
 			log.Errorf("Failed: Rejuvenate, fs.Reset, err=%v", err)
 			return &api.ApiRet{Status: ErrnoToReply(err)}, nil
 		}
@@ -2496,10 +1884,15 @@ func (n *NodeServer) Rejuvenate(_ context.Context, _ *api.Void) (*api.ApiRet, er
 	go func() {
 		if n.Shutdown(true) {
 			if !n.CheckReset() {
-				log.Fatalf("Failed: Rejuvenate, CheckReset failure")
+				log.Errorf("Failed: Rejuvenate, CheckReset failure")
+				return
 			}
 			log.Infof("Rejuvenate: confirmed all states are reset. restart a new session of node server...")
-			n.Init(n.inodeMgr.back)
+			err := n.Init(n.inodeMgr.back)
+			if err != nil {
+				log.Fatalf("Failed: Rejuvenate, Init, err=%v", err)
+				return
+			}
 			if len(nodes) == 0 {
 				n.fs.EndReset() // unblock FS operations
 				log.Infof("Success: Rejuvenate, skip RequestJoinLocal since we have no other nodes in a cluster.")

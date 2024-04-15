@@ -2,9 +2,11 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
+	"hash/crc32"
 	"net/http"
 	"os"
 	"sync/atomic"
@@ -179,10 +181,12 @@ type RaftBasicReply struct {
 
 func NewRaftBasicReply(Status int32, leader *common.LeaderNodeMsg) RaftBasicReply {
 	r := RaftBasicReply{reply: Status, leaderId: leader.GetNodeId(), leaderAddr: common.NodeAddrInet4{Port: int(leader.GetPort())}}
-	r.leaderAddr.Addr[0] = leader.Addr[0]
-	r.leaderAddr.Addr[1] = leader.Addr[1]
-	r.leaderAddr.Addr[2] = leader.Addr[2]
-	r.leaderAddr.Addr[3] = leader.Addr[3]
+	if addr := leader.GetAddr(); addr != nil {
+		r.leaderAddr.Addr[0] = addr[0]
+		r.leaderAddr.Addr[1] = addr[1]
+		r.leaderAddr.Addr[2] = addr[2]
+		r.leaderAddr.Addr[3] = addr[3]
+	}
 	return r
 }
 
@@ -232,4 +236,10 @@ func (r *MyRandString) Get(digit int64) string {
 		b[i] = letters[r.xorShift()%uint64(len(letters))]
 	}
 	return string(b)
+}
+
+func GetBufCheckSum(buf []byte) []byte {
+	chkSum := crc32.NewIEEE()
+	_, _ = chkSum.Write(buf)
+	return chkSum.Sum(nil)
 }

@@ -2,6 +2,7 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
@@ -109,16 +110,19 @@ func NewObjCacheFromSecrets(buckets []BucketCredential, debugS3 bool, bufferSize
 func NewObjCache(secretFile string, debugS3 bool, bufferSize int) (*ObjCacheBackend, error) {
 	f, err := os.Open(secretFile)
 	if err != nil {
-		log.Fatalf("Failed: NewObjCache, secretFile=%v, err=%v", secretFile, err)
+		log.Errorf("Failed: NewObjCache, secretFile=%v, err=%v", secretFile, err)
+		return nil, err
 	}
 	buf, err := io.ReadAll(f)
 	_ = f.Close()
 	if err != nil {
-		log.Fatalf("Failed: NewObjCache, ReadAll, err=%v", err)
+		log.Errorf("Failed: NewObjCache, ReadAll, err=%v", err)
+		return nil, err
 	}
 	conf := BucketCredentials{}
 	if err = yaml.UnmarshalStrict(buf, &conf); err != nil {
-		log.Fatalf("Failed: NewObjCache, UnmarshalStrict, err=%v", err)
+		log.Errorf("Failed: NewObjCache, UnmarshalStrict, err=%v", err)
+		return nil, err
 	}
 	return NewObjCacheFromSecrets(conf.Buckets, debugS3, bufferSize)
 }

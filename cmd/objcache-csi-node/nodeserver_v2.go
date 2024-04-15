@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sys/unix"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/mount-utils"
 )
 
 type StageInfo struct {
@@ -65,6 +66,7 @@ type nodeServerV2 struct {
 	stageInfos    map[string]*StageInfo
 	lock          *sync.Mutex
 	msgChan       chan interface{}
+	termChan      chan struct{}
 }
 
 func NewNodeServerV2(fuseBinPath string, goDebugEnvVar string, goMemLimit string, configFile string, nodeId string, rootDir string, externalIp string, portBegin int, portEnd int) *nodeServerV2 {
@@ -83,6 +85,7 @@ func NewNodeServerV2(fuseBinPath string, goDebugEnvVar string, goMemLimit string
 		portEnd:       portEnd,
 		nextPort:      portBegin,
 		ports:         make(map[int]bool),
+		termChan:      make(chan struct{}),
 	}
 	go ret.UnstageThread()
 	return ret
@@ -306,6 +309,7 @@ func (ns *nodeServerV2) NodeUnstageVolume(_ context.Context, req *csi.NodeUnstag
 
 func (ns *nodeServerV2) StopUnstageThread() {
 	ns.msgChan <- struct{}{}
+	<-ns.termChan
 }
 
 func (ns *nodeServerV2) UnstageThread() {
@@ -385,6 +389,7 @@ func (ns *nodeServerV2) UnstageThread() {
 			nextWakeupTime = time.Now().Add(time.Hour)
 		}
 	}
+	ns.termChan <- struct{}{}
 }
 
 // NodeGetCapabilities returns the supported capabilities of the node server
@@ -420,4 +425,21 @@ func (ns *nodeServerV2) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReq
 
 func (ns *nodeServerV2) NodeGetVolumeStats(ctx context.Context, in *csi.NodeGetVolumeStatsRequest) (*csi.NodeGetVolumeStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "")
+}
+
+func checkMount(targetPath string, createDir bool) (bool, error) {
+	notMnt, err := mount.New("").IsLikelyNotMountPoint(targetPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if createDir {
+				if err = os.MkdirAll(targetPath, 0750); err != nil {
+					return false, err
+				}
+			}
+			notMnt = true
+		} else {
+			return false, err
+		}
+	}
+	return notMnt, nil
 }

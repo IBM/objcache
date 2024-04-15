@@ -2,6 +2,7 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
@@ -290,18 +291,18 @@ func NewBlankSlicedPageBuffer(size int64) SlicedPageBuffer {
  *     <- al ->
  *     <------------ len(buf.Buf) ----->
  * original request is (offset o, dataLen) but we need to align SectorSize for offset and size.
- * BufferedFilePageReader must still return the range [o, o + dataLen] regardless of reading more than it.
- * bf: bufFileOffset is calculated by offset o and dataLen at prepareBuffer, aligned to be a multiple of SectorSize
+ * BufferedDiskPageReader must still return the range [o, o + dataLen] regardless of reading more than it.
+ * bf: bufLogOffset is calculated by offset o and dataLen at prepareBuffer, aligned to be a multiple of SectorSize
  * al: alignLeft to align offset to be a multiple of SectorSize
  */
-type BufferedFilePageReader struct {
-	buf           *PageBuffer
-	fileId        FileIdType
-	bufFileOffset int64
-	alignLeft     int64
-	dataLen       int64
-	prev          *BufferedFilePageReader
-	next          *BufferedFilePageReader
+type BufferedDiskPageReader struct {
+	buf          *PageBuffer
+	logId        LogIdType
+	bufLogOffset int64
+	alignLeft    int64
+	dataLen      int64
+	prev         *BufferedDiskPageReader
+	next         *BufferedDiskPageReader
 }
 
 func CalcRequiredPageBufferSize(offset int64, dataLen int64) int64 {
@@ -313,45 +314,45 @@ func CalcRequiredPageBufferSize(offset int64, dataLen int64) int64 {
 	return alignedSize
 }
 
-func NewBufferedFilePageReaderFromStag(page *PageBuffer, fileId FileIdType, fileOffset int64, dataLen int64) *BufferedFilePageReader {
-	r := &BufferedFilePageReader{buf: page, fileId: fileId}
+func NewBufferedDiskPageReaderFromStag(page *PageBuffer, logId LogIdType, logOffset int64, dataLen int64) *BufferedDiskPageReader {
+	r := &BufferedDiskPageReader{buf: page, logId: logId}
 	r.next = r
 	r.prev = r
 	r.dataLen = dataLen
-	r.alignLeft = fileOffset % int64(SectorSize)
-	r.bufFileOffset = fileOffset - r.alignLeft
+	r.alignLeft = logOffset % int64(SectorSize)
+	r.bufLogOffset = logOffset - r.alignLeft
 	return r
 }
 
 // GetSlicedPageBufferAt returns slice of Buf with ref count incremented. user must call .Release() later.
-func (r *BufferedFilePageReader) GetSlicedPageBufferAt(stagPart *StagingChunkPart, offset int64, dec func(interface{})) (SlicedPageBuffer, error) {
+func (r *BufferedDiskPageReader) GetSlicedPageBufferAt(stagPart *StagingChunkPart, offset int64, dec func(interface{})) (SlicedPageBuffer, error) {
 	stagPartSlop := stagPart.slop
 	stag := stagPart.chunk
 
 	/*
-	 * a working is physically mapped to a file with varied offsets to optimize random writes.
+	 * a working is physically mapped to a log with varied offsets to optimize random writes.
 	 * Suppose offset=12K is passed. we want to know a region marked as '*' in the below figure
 	 *    8K             16K
-	 * ---F=======|***|====F---- : file, (|***|: a region (offsetInFile, offsetInFile + lengthInFile)
+	 * ---F=======|***|====F---- : log, (|***|: a region (offsetInLog, offsetInLog + lengthInLog)
 	 *     \       \   \    \
 	 *      \       \   \    \
 	 *  -----D---X===|===X----D- : offset within a working (D-D : original stag, X=X: shrunk one by other writes)
 	 *       10K 11K 12K 14K 18K
-	 * 12K is an offset within a working, so, offsetInFile= 12K - 10K + 8K == 10K, lengthInFile = 14K - 12K
+	 * 12K is an offset within a working, so, offsetInLog= 12K - 10K + 8K == 10K, lengthInLog = 14K - 12K
 	 * 8K = stag.offset, 16K = stag.offset + stag.length
 	 * 10K = stag.slop 11K = stagPartSlop 14K = stagPartSlop + stagPart.length, 18K = stag.slop + stag.length
 	 */
-	offsetInFile := offset - stag.slop + stag.fileOffset
-	lengthInFile := stagPartSlop + stagPart.length - offset
-	//log.Debugf("prepareRead: fileId=%v, offsetInFile=%v, lengthInFile=%v", reader.fileId, offsetInFile, lengthInFile)
+	offsetInLog := offset - stag.slop + stag.logOffset
+	lengthInLog := stagPartSlop + stagPart.length - offset
+	//log.Debugf("prepareRead: logId=%v, offsetInLog=%v, lengthInLog=%v", reader.logId, offsetInLog, lengthInLog)
 
 	bufSize := int64(len(r.buf.Buf))
-	if offsetInFile < r.bufFileOffset+r.alignLeft || r.bufFileOffset+bufSize <= offsetInFile {
-		log.Errorf("GetSlicedPageBufferAt, offset and dataLen is out of range, offsetInFile=%v, lengthInFile=%v, c=%v", offsetInFile, lengthInFile, 0)
+	if offsetInLog < r.bufLogOffset+r.alignLeft || r.bufLogOffset+bufSize <= offsetInLog {
+		log.Errorf("GetSlicedPageBufferAt, offset and dataLen is out of range, offsetInLog=%v, lengthInLog=%v, c=%v", offsetInLog, lengthInLog, 0)
 		return SlicedPageBuffer{}, io.EOF
 	}
-	bufOff := offsetInFile - r.bufFileOffset
-	lastOffset := bufOff + lengthInFile
+	bufOff := offsetInLog - r.bufLogOffset
+	lastOffset := bufOff + lengthInLog
 	if lastOffset > bufSize {
 		lastOffset = bufSize
 	}
@@ -359,24 +360,24 @@ func (r *BufferedFilePageReader) GetSlicedPageBufferAt(stagPart *StagingChunkPar
 }
 
 type FillingKey2 struct {
-	fileId FileIdType
+	logId  LogIdType
 	offset int64
 }
 
 type ReaderBufferCache struct {
 	cond         *sync.Cond
 	lock         *sync.RWMutex
-	cache        map[FileIdType]map[int64]*BufferedFilePageReader
+	cache        map[LogIdType]map[int64]*BufferedDiskPageReader
 	filling      map[FillingKey2]*FillingInfo
 	currentSize  int64
 	inFlightSize int64
 	maxSize      int64
-	accessHead   BufferedFilePageReader
+	accessHead   BufferedDiskPageReader
 }
 
 func NewReaderBufferCache(flags *common.ObjcacheConfig) *ReaderBufferCache {
 	r := &ReaderBufferCache{
-		lock: new(sync.RWMutex), cond: sync.NewCond(new(sync.Mutex)), cache: make(map[FileIdType]map[int64]*BufferedFilePageReader),
+		lock: new(sync.RWMutex), cond: sync.NewCond(new(sync.Mutex)), cache: make(map[LogIdType]map[int64]*BufferedDiskPageReader),
 		maxSize: flags.ChunkCacheSizeBytes, filling: make(map[FillingKey2]*FillingInfo),
 	}
 	r.accessHead.prev = &r.accessHead
@@ -384,14 +385,14 @@ func NewReaderBufferCache(flags *common.ObjcacheConfig) *ReaderBufferCache {
 	return r
 }
 
-func (c *ReaderBufferCache) TryBeginFill(fileId FileIdType, offset int64) (beginFill bool) {
-	key := FillingKey2{fileId: fileId, offset: offset}
+func (c *ReaderBufferCache) TryBeginFill(logId LogIdType, offset int64) (beginFill bool) {
+	key := FillingKey2{logId: logId, offset: offset}
 	c.lock.Lock()
 	if _, ok := c.filling[key]; ok {
 		c.lock.Unlock()
 		return false
 	}
-	if offsets, ok := c.cache[fileId]; ok {
+	if offsets, ok := c.cache[logId]; ok {
 		if _, ok2 := offsets[key.offset]; ok2 {
 			//Note: this does not call c.deleteFromLRUList()
 			c.lock.Unlock()
@@ -403,14 +404,14 @@ func (c *ReaderBufferCache) TryBeginFill(fileId FileIdType, offset int64) (begin
 	return true
 }
 
-func (c *ReaderBufferCache) GetCacheOrBeginFill(fileId FileIdType, offset int64) (reader *BufferedFilePageReader, beginFill bool) {
-	key := FillingKey2{fileId: fileId, offset: offset}
+func (c *ReaderBufferCache) GetCacheOrBeginFill(logId LogIdType, offset int64) (reader *BufferedDiskPageReader, beginFill bool) {
+	key := FillingKey2{logId: logId, offset: offset}
 	c.lock.Lock()
 	if _, ok := c.filling[key]; ok {
 		c.lock.Unlock()
 		return nil, false
 	}
-	if offsets, ok := c.cache[fileId]; ok {
+	if offsets, ok := c.cache[logId]; ok {
 		if cache, ok2 := offsets[key.offset]; ok2 {
 			c.deleteFromLRUList(cache)
 			cache.buf.Up()
@@ -423,9 +424,9 @@ func (c *ReaderBufferCache) GetCacheOrBeginFill(fileId FileIdType, offset int64)
 	return nil, true
 }
 
-func (c *ReaderBufferCache) GetCacheWithFillWait(fileId FileIdType, stagPart *StagingChunkPart, offset int64) *BufferedFilePageReader {
+func (c *ReaderBufferCache) GetCacheWithFillWait(logId LogIdType, stagPart *StagingChunkPart, offset int64) *BufferedDiskPageReader {
 	stag := stagPart.chunk
-	key := FillingKey2{fileId: fileId, offset: stag.fileOffset}
+	key := FillingKey2{logId: logId, offset: stag.logOffset}
 	c.lock.Lock()
 	for {
 		filling, ok := c.filling[key]
@@ -442,8 +443,8 @@ func (c *ReaderBufferCache) GetCacheWithFillWait(fileId FileIdType, stagPart *St
 			break
 		}
 	}
-	if offsets, ok := c.cache[fileId]; ok {
-		if cache, ok2 := offsets[stag.fileOffset]; ok2 {
+	if offsets, ok := c.cache[logId]; ok {
+		if cache, ok2 := offsets[stag.logOffset]; ok2 {
 			c.deleteFromLRUList(cache)
 			cache.buf.Up()
 			c.lock.Unlock()
@@ -455,8 +456,8 @@ func (c *ReaderBufferCache) GetCacheWithFillWait(fileId FileIdType, stagPart *St
 	return nil
 }
 
-func (c *ReaderBufferCache) EndFill(fileId FileIdType, offset int64) {
-	key := FillingKey2{fileId: fileId, offset: offset}
+func (c *ReaderBufferCache) EndFill(logId LogIdType, offset int64) {
+	key := FillingKey2{logId: logId, offset: offset}
 	c.lock.Lock()
 	filling, ok := c.filling[key]
 	if ok {
@@ -471,10 +472,10 @@ func (c *ReaderBufferCache) EndFill(fileId FileIdType, offset int64) {
 	}
 }
 
-func (c *ReaderBufferCache) EndFillWithPut(reader *BufferedFilePageReader) {
-	fileId := reader.fileId
-	fileOffset := reader.bufFileOffset + reader.alignLeft
-	key := FillingKey2{fileId: fileId, offset: fileOffset}
+func (c *ReaderBufferCache) EndFillWithPut(reader *BufferedDiskPageReader) {
+	logId := reader.logId
+	logOffset := reader.bufLogOffset + reader.alignLeft
+	key := FillingKey2{logId: logId, offset: logOffset}
 	size := int64(cap(reader.buf.Buf))
 
 	c.lock.Lock()
@@ -484,14 +485,14 @@ func (c *ReaderBufferCache) EndFillWithPut(reader *BufferedFilePageReader) {
 	} else {
 		log.Warnf("BUG: ReaderBufferCache.EndFillWithPut, no key for fillling, key=%v", key)
 	}
-	if offsets, ok := c.cache[fileId]; ok {
-		if _, ok2 := offsets[fileOffset]; ok2 {
+	if offsets, ok := c.cache[logId]; ok {
+		if _, ok2 := offsets[logOffset]; ok2 {
 			log.Warnf("BUG: ReaderBufferCache.EndFillWithPut, overwrite cache")
 		}
 	} else {
-		c.cache[fileId] = make(map[int64]*BufferedFilePageReader)
+		c.cache[logId] = make(map[int64]*BufferedDiskPageReader)
 	}
-	c.cache[fileId][fileOffset] = reader
+	c.cache[logId][logOffset] = reader
 	c.lock.Unlock()
 
 	c.cond.L.Lock()
@@ -508,7 +509,7 @@ func (c *ReaderBufferCache) EndFillWithPut(reader *BufferedFilePageReader) {
 	}
 }
 
-func (c *ReaderBufferCache) ReleaseInFlightBuffer(reader *BufferedFilePageReader) {
+func (c *ReaderBufferCache) ReleaseInFlightBuffer(reader *BufferedDiskPageReader) {
 	if reader.buf.IsEvictable() {
 		size := int64(cap(reader.buf.Buf))
 		ReturnPageBuffer(reader.buf)
@@ -521,7 +522,7 @@ func (c *ReaderBufferCache) ReleaseInFlightBuffer(reader *BufferedFilePageReader
 	}
 }
 
-func (c *ReaderBufferCache) SetEvictable(reader *BufferedFilePageReader) {
+func (c *ReaderBufferCache) SetEvictable(reader *BufferedDiskPageReader) {
 	count := reader.buf.Down()
 	if count == 0 {
 		c.lock.Lock()
@@ -534,31 +535,31 @@ func (c *ReaderBufferCache) SetEvictable(reader *BufferedFilePageReader) {
 			c.cond.Broadcast()
 		}
 	} else if count < 0 {
-		log.Fatalf("BUG: SetEvictable, count < 0, reader=%v", reader)
+		log.Warnf("BUG: SetEvictable, count < 0, reader=%v", reader)
 	}
 }
 
 func (c *ReaderBufferCache) dec(orig interface{}) {
-	c.SetEvictable(orig.(*BufferedFilePageReader))
+	c.SetEvictable(orig.(*BufferedDiskPageReader))
 }
 
-func (c *ReaderBufferCache) Delete(fileId FileIdType) (size int64) {
+func (c *ReaderBufferCache) Delete(logId LogIdType) (size int64) {
 	size = int64(0)
 	c.lock.Lock()
-	if offsets, ok := c.cache[fileId]; ok {
+	if offsets, ok := c.cache[logId]; ok {
 		for _, reader := range offsets {
-			delete(offsets, reader.bufFileOffset+reader.alignLeft)
+			delete(offsets, reader.bufLogOffset+reader.alignLeft)
 			if len(offsets) == 0 {
-				delete(c.cache, reader.fileId)
+				delete(c.cache, reader.logId)
 			}
 			if reader.buf.IsEvictable() {
 				c.deleteFromLRUList(reader)
 				size += int64(cap(reader.buf.Buf))
 				ReturnPageBuffer(reader.buf)
 			} else {
-				key := FileIdType{lower: uint64(math.MaxUint64), upper: uint64(math.MaxUint64)}
+				key := LogIdType{lower: uint64(math.MaxUint64), upper: uint32(math.MaxUint32)}
 				if _, ok3 := c.cache[key]; !ok3 {
-					c.cache[key] = make(map[int64]*BufferedFilePageReader)
+					c.cache[key] = make(map[int64]*BufferedDiskPageReader)
 				}
 				c.cache[key][int64(len(c.cache[key]))] = reader
 			}
@@ -574,8 +575,8 @@ func (c *ReaderBufferCache) Delete(fileId FileIdType) (size int64) {
 	return
 }
 
-func (c *ReaderBufferCache) GetNewBufferedFilePageReader(fileId FileIdType, stag *StagingChunk, blocking bool) (*BufferedFilePageReader, error) {
-	alignedSize := CalcRequiredPageBufferSize(stag.fileOffset, stag.length)
+func (c *ReaderBufferCache) GetNewBufferedDiskPageReader(logId LogIdType, stag *StagingChunk, blocking bool) (*BufferedDiskPageReader, error) {
+	alignedSize := CalcRequiredPageBufferSize(stag.logOffset, stag.length)
 	c.cond.L.Lock()
 	for c.inFlightSize+c.currentSize+alignedSize > c.maxSize {
 		exceed := c.inFlightSize + c.currentSize + alignedSize - c.maxSize
@@ -600,11 +601,11 @@ func (c *ReaderBufferCache) GetNewBufferedFilePageReader(fileId FileIdType, stag
 		c.cond.L.Unlock()
 		return nil, err
 	}
-	ret := NewBufferedFilePageReaderFromStag(page, fileId, stag.fileOffset, stag.length)
+	ret := NewBufferedDiskPageReaderFromStag(page, logId, stag.logOffset, stag.length)
 	return ret, nil
 }
 
-func (c *ReaderBufferCache) updateLRUList(r *BufferedFilePageReader) {
+func (c *ReaderBufferCache) updateLRUList(r *BufferedDiskPageReader) {
 	if r.next != nil {
 		r.prev.next = r.next
 		r.next.prev = r.prev
@@ -615,7 +616,7 @@ func (c *ReaderBufferCache) updateLRUList(r *BufferedFilePageReader) {
 	c.accessHead.next = r
 }
 
-func (c *ReaderBufferCache) deleteFromLRUList(r *BufferedFilePageReader) {
+func (c *ReaderBufferCache) deleteFromLRUList(r *BufferedDiskPageReader) {
 	r.prev.next = r.next
 	r.next.prev = r.prev
 	r.prev = r
@@ -637,10 +638,10 @@ func (c *ReaderBufferCache) reclaim(reclaimSize int64) {
 			c.deleteFromLRUList(reader)
 			size += int64(cap(reader.buf.Buf))
 			ReturnPageBuffer(reader.buf)
-			if offsets, ok := c.cache[reader.fileId]; ok {
-				delete(offsets, reader.bufFileOffset+reader.alignLeft)
+			if offsets, ok := c.cache[reader.logId]; ok {
+				delete(offsets, reader.bufLogOffset+reader.alignLeft)
 				if len(offsets) == 0 {
-					delete(c.cache, reader.fileId)
+					delete(c.cache, reader.logId)
 				}
 			}
 		} else {
@@ -662,8 +663,8 @@ func (c *ReaderBufferCache) reclaim(reclaimSize int64) {
 }
 
 func (c *ReaderBufferCache) DropAll() {
-	for fileId := range c.cache {
-		c.Delete(fileId)
+	for logId := range c.cache {
+		c.Delete(logId)
 	}
 }
 
@@ -1071,7 +1072,7 @@ func (c *RemoteBufferCache) CheckReset() (ok bool) {
 	return
 }
 
-type FileOffsetPair struct {
+type LogOffsetPair struct {
 	inode  InodeKeyType
 	offset int64
 	size   int
@@ -1080,12 +1081,12 @@ type FileOffsetPair struct {
 
 type LocalReadHistory struct {
 	lock    *sync.RWMutex
-	cache   map[InodeKeyType]map[int64]*FileOffsetPair
+	cache   map[InodeKeyType]map[int64]*LogOffsetPair
 	history *list.List
 }
 
 func NewLocalBufferCacheHistory() *LocalReadHistory {
-	return &LocalReadHistory{lock: new(sync.RWMutex), cache: make(map[InodeKeyType]map[int64]*FileOffsetPair), history: list.New()}
+	return &LocalReadHistory{lock: new(sync.RWMutex), cache: make(map[InodeKeyType]map[int64]*LogOffsetPair), history: list.New()}
 }
 
 func (c *LocalReadHistory) Has(inodeKey InodeKeyType, offset int64) (int, bool) {
@@ -1106,7 +1107,7 @@ func (c *LocalReadHistory) Add(inodeKey InodeKeyType, offset int64, length int) 
 	if c.history.Len() > 1024 {
 		back := c.history.Back()
 		c.history.Remove(back)
-		old := back.Value.(*FileOffsetPair)
+		old := back.Value.(*LogOffsetPair)
 		if offsets, ok := c.cache[old.inode]; ok {
 			delete(offsets, old.offset)
 			if len(offsets) == 0 {
@@ -1114,10 +1115,10 @@ func (c *LocalReadHistory) Add(inodeKey InodeKeyType, offset int64, length int) 
 			}
 		}
 	}
-	entry := &FileOffsetPair{inode: inodeKey, offset: offset, size: length}
+	entry := &LogOffsetPair{inode: inodeKey, offset: offset, size: length}
 	entry.p = c.history.PushFront(entry)
 	if _, ok := c.cache[inodeKey]; !ok {
-		c.cache[inodeKey] = make(map[int64]*FileOffsetPair)
+		c.cache[inodeKey] = make(map[int64]*LogOffsetPair)
 	}
 	c.cache[inodeKey][offset] = entry
 	c.lock.Unlock()
@@ -1137,7 +1138,7 @@ func (c *LocalReadHistory) Delete(inodeKey InodeKeyType) {
 func (c *LocalReadHistory) DropAll() {
 	c.lock.Lock()
 	c.history = list.New()
-	c.cache = make(map[InodeKeyType]map[int64]*FileOffsetPair)
+	c.cache = make(map[InodeKeyType]map[int64]*LogOffsetPair)
 	c.lock.Unlock()
 }
 

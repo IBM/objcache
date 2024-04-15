@@ -2,9 +2,11 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
+	"math"
 	"sync"
 	"time"
 
@@ -119,12 +121,14 @@ func (m *MigrationId) toMsg() *common.MigrationIdMsg {
 }
 
 type DirtyMgr struct {
-	cTable       map[InodeKeyType]DirtyChunkInfo // key: inodeKey
-	mTable       map[InodeKeyType]DirtyMetaInfo  // DirtyMetaInfo
-	expireTable  *btree.BTree
-	dTable       map[string]DeletedFileInfo // deleted file paths
-	expireDTable *btree.BTree
-	migrating    map[MigrationId]*common.MigrationMsg
+	cTable           map[InodeKeyType]DirtyChunkInfo // key: inodeKey
+	mTable           map[InodeKeyType]DirtyMetaInfo  // DirtyMetaInfo
+	addChildTable    map[InodeKeyType]map[string]bool
+	removeChildTable map[InodeKeyType]map[string]bool
+	expireTable      *btree.BTree
+	dTable           map[string]DeletedFileInfo // deleted file paths
+	expireDTable     *btree.BTree
+	migrating        map[MigrationId]*common.MigrationMsg
 
 	lock          *sync.RWMutex
 	migratingLock *sync.RWMutex
@@ -132,14 +136,16 @@ type DirtyMgr struct {
 
 func NewDirtyMgr() *DirtyMgr {
 	ret := &DirtyMgr{
-		cTable:        make(map[InodeKeyType]DirtyChunkInfo),
-		mTable:        make(map[InodeKeyType]DirtyMetaInfo),
-		expireTable:   btree.New(3),
-		dTable:        make(map[string]DeletedFileInfo),
-		expireDTable:  btree.New(3),
-		lock:          new(sync.RWMutex),
-		migrating:     make(map[MigrationId]*common.MigrationMsg),
-		migratingLock: new(sync.RWMutex),
+		cTable:           make(map[InodeKeyType]DirtyChunkInfo),
+		mTable:           make(map[InodeKeyType]DirtyMetaInfo),
+		addChildTable:    make(map[InodeKeyType]map[string]bool),
+		removeChildTable: make(map[InodeKeyType]map[string]bool),
+		expireTable:      btree.New(3),
+		dTable:           make(map[string]DeletedFileInfo),
+		expireDTable:     btree.New(3),
+		lock:             new(sync.RWMutex),
+		migrating:        make(map[MigrationId]*common.MigrationMsg),
+		migratingLock:    new(sync.RWMutex),
 	}
 	return ret
 }
@@ -262,6 +268,40 @@ func (d *DirtyMgr) RemoveNonDirtyChunks(fps []uint64) {
 	d.lock.Unlock()
 }
 
+func (d *DirtyMgr) AddChildMetaNoLock(meta *WorkingMeta, name string) {
+	dirtyMap, ok := d.removeChildTable[meta.inodeKey]
+	if ok {
+		delete(dirtyMap, name)
+		if len(dirtyMap) == 0 {
+			delete(d.removeChildTable, meta.inodeKey)
+		}
+		return
+	}
+	dirtyMap, ok = d.addChildTable[meta.inodeKey]
+	if !ok {
+		dirtyMap = make(map[string]bool)
+		d.addChildTable[meta.inodeKey] = dirtyMap
+	}
+	dirtyMap[name] = true
+}
+
+func (d *DirtyMgr) RemoveChildMetaNoLock(meta *WorkingMeta, name string) {
+	dirtyMap, ok := d.addChildTable[meta.inodeKey]
+	if ok {
+		delete(dirtyMap, name)
+		if len(dirtyMap) == 0 {
+			delete(d.addChildTable, meta.inodeKey)
+		}
+		return
+	}
+	dirtyMap, ok = d.removeChildTable[meta.inodeKey]
+	if !ok {
+		dirtyMap = make(map[string]bool)
+		d.removeChildTable[meta.inodeKey] = dirtyMap
+	}
+	dirtyMap[name] = true
+}
+
 func (d *DirtyMgr) AddMetaNoLock(meta *WorkingMeta) {
 	old, ok := d.mTable[meta.inodeKey]
 	info := NewDirtyMetaInfoFromMeta(meta)
@@ -272,7 +312,7 @@ func (d *DirtyMgr) AddMetaNoLock(meta *WorkingMeta) {
 		}
 		d.expireTable.ReplaceOrInsert(NewExpireInfoFromMeta(meta, info.timestamp))
 	}
-	log.Debugf("Success: DirtyMgr.AddMetaNoLock, meta=%v", *meta)
+	log.Debugf("Success: DirtyMgr.AddMetaNoLock, inodeKey=%v", meta.inodeKey)
 }
 
 func (d *DirtyMgr) RemoveMetaNoLock(inodeId InodeKeyType) {
@@ -369,6 +409,14 @@ func (d *DirtyMgr) CopyAllPrimaryDeletedKeys() map[string]InodeKeyType {
 	return ret
 }
 
+func (d *DirtyMgr) GetAllDirtyMeta() []*common.DirtyMetaInfoMsg {
+	ret := make([]*common.DirtyMetaInfoMsg, 0)
+	for inodeKey, info := range d.mTable {
+		ret = append(ret, &common.DirtyMetaInfoMsg{InodeKey: uint64(inodeKey), Version: info.version, Timestamp: info.timestamp, ExpireMs: info.expireMs})
+	}
+	return ret
+}
+
 func (d *DirtyMgr) CopyAllExpiredPrimaryDirtyMeta() []InodeKeyType {
 	timestamp := time.Now().UnixNano()
 	ret := make([]InodeKeyType, 0)
@@ -401,8 +449,9 @@ func (d *DirtyMgr) CopyAllExpiredPrimaryDeletedDirtyMeta() map[string]InodeKeyTy
 }
 
 // GetDirtyMetaForNodeLeave returns a blank string if the number of participant Node is < nrReplicas
-func (d *DirtyMgr) GetDirtyMetaForNodeLeave(nodeList *RaftNodeList) map[string][]InodeKeyType {
-	ret := map[string][]InodeKeyType{}
+func (d *DirtyMgr) GetDirtyMetaForNodeLeave(nodeList *RaftNodeList) (map[InodeKeyType]bool, map[string]map[InodeKeyType]bool) {
+	ret2 := make(map[InodeKeyType]bool)
+	ret := map[string]map[InodeKeyType]bool{}
 	d.lock.RLock()
 	for inodeKey := range d.mTable {
 		g, ok := GetGroupForMeta(nodeList.ring, inodeKey)
@@ -410,24 +459,25 @@ func (d *DirtyMgr) GetDirtyMetaForNodeLeave(nodeList *RaftNodeList) map[string][
 			continue
 		}
 		if _, ok2 := ret[g]; !ok2 {
-			ret[g] = make([]InodeKeyType, 0)
+			ret[g] = make(map[InodeKeyType]bool)
 		}
-		ret[g] = append(ret[g], inodeKey)
+		ret[g][inodeKey] = true
+		ret2[inodeKey] = true
 	}
 	d.lock.RUnlock()
-	return ret
+	return ret2, ret
 }
 
-func (d *DirtyMgr) GetDirMetaForNodeLeave(keys []InodeKeyType, nodeList *RaftNodeList) map[string][]InodeKeyType {
-	ret := map[string][]InodeKeyType{}
+func (d *DirtyMgr) GetDirMetaForNodeLeave(keys []*common.InodeTreeMsg, nodeList *RaftNodeList) map[string][]*common.InodeTreeMsg {
+	ret := map[string][]*common.InodeTreeMsg{}
 	d.lock.RLock()
 	for _, inodeKey := range keys {
-		g, ok := GetGroupForMeta(nodeList.ring, inodeKey)
+		g, ok := GetGroupForMeta(nodeList.ring, InodeKeyType(inodeKey.GetInodeKey()))
 		if !ok {
 			continue
 		}
 		if _, ok2 := ret[g]; !ok2 {
-			ret[g] = make([]InodeKeyType, 0)
+			ret[g] = make([]*common.InodeTreeMsg, 0)
 		}
 		ret[g] = append(ret[g], inodeKey)
 	}
@@ -451,8 +501,8 @@ func (d *DirtyMgr) GetDirtyChunkAll() map[InodeKeyType]DirtyChunkInfo {
 	return ret
 }
 
-func (d *DirtyMgr) GetDirtyMetasForNodeJoin(migrationId MigrationId, nodeList *RaftNodeList, newRing *hashring.HashRing, selfGroup string, joinGroup string) []InodeKeyType {
-	keys := make([]InodeKeyType, 0)
+func (d *DirtyMgr) GetDirtyMetasForNodeJoin(migrationId MigrationId, nodeList *RaftNodeList, newRing *hashring.HashRing, selfGroup string, joinGroup string) map[InodeKeyType]bool {
+	keys := make(map[InodeKeyType]bool)
 	d.lock.RLock()
 	d.migratingLock.RLock()
 	for inodeKey := range d.mTable {
@@ -461,8 +511,8 @@ func (d *DirtyMgr) GetDirtyMetasForNodeJoin(migrationId MigrationId, nodeList *R
 			continue
 		}
 		newOwner, ok := GetGroupForMeta(newRing, inodeKey)
-		if ok && newOwner == joinGroup && !d.IsRemoveMetaRecorded(migrationId, inodeKey) {
-			keys = append(keys, inodeKey)
+		if ok && newOwner == joinGroup {
+			keys[inodeKey] = true
 		}
 	}
 	d.migratingLock.RUnlock()
@@ -470,18 +520,18 @@ func (d *DirtyMgr) GetDirtyMetasForNodeJoin(migrationId MigrationId, nodeList *R
 	return keys
 }
 
-func (d *DirtyMgr) GetDirMetasForNodeJoin(dirMetas []InodeKeyType, migrationId MigrationId, nodeList *RaftNodeList, newRing *hashring.HashRing, selfGroup string, joinGroup string) []InodeKeyType {
-	keys := make([]InodeKeyType, 0)
+func (d *DirtyMgr) GetDirInodesForNodeJoin(dirInodes []*common.InodeTreeMsg, migrationId MigrationId, nodeList *RaftNodeList, newRing *hashring.HashRing, selfGroup string, joinGroup string) []*common.InodeTreeMsg {
+	keys := make([]*common.InodeTreeMsg, 0)
 	d.lock.RLock()
 	d.migratingLock.RLock()
-	for _, inodeKey := range dirMetas {
-		oldOwner, ok := GetGroupForMeta(nodeList.ring, inodeKey)
+	for _, inodeMsg := range dirInodes {
+		oldOwner, ok := GetGroupForMeta(nodeList.ring, InodeKeyType(inodeMsg.InodeKey))
 		if !ok || oldOwner != selfGroup {
 			continue
 		}
-		newOwner, ok := GetGroupForMeta(newRing, inodeKey)
-		if ok && newOwner == joinGroup && !d.IsRemoveMetaRecorded(migrationId, inodeKey) {
-			keys = append(keys, inodeKey)
+		newOwner, ok := GetGroupForMeta(newRing, InodeKeyType(inodeMsg.InodeKey))
+		if ok && newOwner == joinGroup {
+			keys = append(keys, inodeMsg)
 		}
 	}
 	d.migratingLock.RUnlock()
@@ -500,7 +550,7 @@ func (d *DirtyMgr) GetDirtyChunkForNodeJoin(migrationId MigrationId, nodeList *R
 				continue
 			}
 			newOwner, ok := GetGroupForChunk(newRing, inodeKey, offset, chunkInfo.chunkSize)
-			if ok && newOwner == joinGroupId && !d.IsRemoveChunkRecorded(migrationId, inodeKey, offset) {
+			if ok && newOwner == joinGroupId {
 				if _, ok2 := ret[inodeKey]; !ok2 {
 					copied := chunkInfo
 					copied.OffsetVersions = make(map[int64]uint32)
@@ -515,134 +565,18 @@ func (d *DirtyMgr) GetDirtyChunkForNodeJoin(migrationId MigrationId, nodeList *R
 	return ret
 }
 
-func (d *DirtyMgr) RecordMigratedAddMetas(migrationId MigrationId, metas []*common.CopiedMetaMsg, files []*common.InodeToFileMsg) {
+func (d *DirtyMgr) CommitMigratedDataLocal(inodeMgr *InodeMgr, migrationId MigrationId) {
 	d.migratingLock.Lock()
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		mig = &common.MigrationMsg{}
-		d.migrating[migrationId] = mig
-	}
-	mig.AddMetas = append(mig.AddMetas, metas...)
-	mig.AddFiles = append(mig.AddFiles, files...)
+	m, ok := d.migrating[migrationId]
+	delete(d.migrating, migrationId)
 	d.migratingLock.Unlock()
-}
-
-func (d *DirtyMgr) RecordMigratedRemoveMetas(migrationId MigrationId, keys ...InodeKeyType) {
-	d.migratingLock.Lock()
-	mig, ok := d.migrating[migrationId]
 	if !ok {
-		mig = &common.MigrationMsg{}
-		d.migrating[migrationId] = mig
-	}
-	for _, inodeKey := range keys {
-		mig.RemoveDirtyInodeIds = append(mig.RemoveDirtyInodeIds, uint64(inodeKey))
-	}
-	d.migratingLock.Unlock()
-}
-
-func (d *DirtyMgr) IsRemoveMetaRecorded(migrationId MigrationId, inodeKey InodeKeyType) bool {
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		return false
-	}
-	strKey := uint64(inodeKey)
-	for _, removedId := range mig.GetRemoveDirtyInodeIds() {
-		if strKey == removedId {
-			return true
-		}
-	}
-	return false
-}
-
-func (d *DirtyMgr) RecordMigratedAddChunks(migrationId MigrationId, inodeKey InodeKeyType, chunkSize int64, chunk *WorkingChunk, offset int64, objectSize int64) {
-	d.migratingLock.Lock()
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		mig = &common.MigrationMsg{}
-		d.migrating[migrationId] = mig
-	}
-	mig.AddChunks = append(mig.AddChunks, &common.AppendCommitUpdateChunksMsg{
-		InodeKey: uint64(inodeKey), ChunkSize: chunkSize, Version: chunk.chunkVer, ObjectSize: objectSize,
-		Chunks: []*common.WorkingChunkAddMsg{{Offset: offset, Stagings: chunk.toStagingChunkAddMsg()}},
-	})
-	d.migratingLock.Unlock()
-}
-
-func (d *DirtyMgr) RecordMigratedRemoveChunks(migrationId MigrationId, inodeKey InodeKeyType, offset int64, version uint32) {
-	d.migratingLock.Lock()
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		mig = &common.MigrationMsg{}
-		d.migrating[migrationId] = mig
-	}
-	mig.RemoveDirtyChunks = append(mig.RemoveDirtyChunks, &common.ChunkRemoveDirtyMsg{InodeKey: uint64(inodeKey), Offset: offset, Version: version})
-	d.migratingLock.Unlock()
-}
-
-func (d *DirtyMgr) IsRemoveChunkRecorded(migrationId MigrationId, inodeKey InodeKeyType, offset int64) bool {
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		return false
-	}
-	strKey := uint64(inodeKey)
-	for _, chunk := range mig.GetRemoveDirtyChunks() {
-		if chunk.GetInodeKey() == strKey && chunk.GetOffset() == offset {
-			return true
-		}
-	}
-	return false
-}
-
-func (d *DirtyMgr) RecordMigratedDirMetas(migrationId MigrationId, metas []*common.CopiedMetaMsg, files []*common.InodeToFileMsg) {
-	d.migratingLock.Lock()
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		mig = &common.MigrationMsg{}
-		d.migrating[migrationId] = mig
-	}
-	mig.DirMetas = append(mig.DirMetas, metas...)
-	mig.DirFiles = append(mig.DirFiles, files...)
-	d.migratingLock.Unlock()
-}
-
-func (d *DirtyMgr) RecordMigratedRemoveDirMetas(migrationId MigrationId, keys ...InodeKeyType) {
-	d.migratingLock.Lock()
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		mig = &common.MigrationMsg{}
-		d.migrating[migrationId] = mig
-	}
-	for _, inodeKey := range keys {
-		mig.RemoveDirInodeIds = append(mig.RemoveDirInodeIds, uint64(inodeKey))
-	}
-	d.migratingLock.Unlock()
-}
-
-func (d *DirtyMgr) IsRemoveDirMetaRecorded(migrationId MigrationId, inodeKey InodeKeyType) bool {
-	mig, ok := d.migrating[migrationId]
-	if !ok {
-		return false
-	}
-	strKey := uint64(inodeKey)
-	for _, removedId := range mig.GetRemoveDirInodeIds() {
-		if strKey == removedId {
-			return true
-		}
-	}
-	return false
-}
-
-func (d *DirtyMgr) commitMigratedDataLocal(inodeMgr *InodeMgr, migrationId MigrationId) {
-	d.migratingLock.RLock()
-	m := d.migrating[migrationId]
-	d.migratingLock.RUnlock()
-	if m == nil {
 		return
 	}
 	inodeMgr.RestoreMetas(m.GetAddMetas(), m.GetAddFiles())
-	inodeMgr.RestoreMetas(m.GetDirMetas(), m.GetDirFiles())
-	inodeMgr.DeleteInodeToFiles(m.GetRemoveDirtyInodeIds())
-	inodeMgr.DeleteInodeToFiles(m.GetRemoveDirInodeIds())
+	inodeMgr.RestoreInodeTree(m.GetDirInodes())
+	inodeMgr.DeleteInode(m.GetRemoveDirtyInodeIds())
+	inodeMgr.DeleteInode(m.GetRemoveDirInodeIds())
 	for _, entry := range m.GetAddChunks() {
 		for _, chunk := range entry.GetChunks() {
 			c := inodeMgr.GetChunk(InodeKeyType(entry.GetInodeKey()), chunk.GetOffset(), entry.GetChunkSize())
@@ -673,7 +607,6 @@ func (d *DirtyMgr) commitMigratedDataLocal(inodeMgr *InodeMgr, migrationId Migra
 		}
 	}
 	d.lock.Unlock()
-	d.DropMigratingData(migrationId)
 }
 
 func (n *InodeMgr) MpuAbort(key string, uploadId string) (reply int32) {
@@ -692,38 +625,19 @@ func (d *DirtyMgr) DropMigratingData(migrationId MigrationId) {
 	d.migratingLock.Unlock()
 }
 
-func (d *DirtyMgr) AppendCommitMigrationLog(raft *RaftInstance, txId TxId, migrationId MigrationId) int32 {
-	d.migratingLock.RLock()
-	mLog, ok := d.migrating[migrationId]
-	d.migratingLock.RUnlock()
-	if !ok {
-		mLog = &common.MigrationMsg{}
-	}
-	mLog.TxId = txId.toMsg()
-	if reply := raft.AppendExtendedLogEntry(AppendEntryCommitMigrationCmdId, mLog); reply != RaftReplyOk {
-		log.Errorf("Failed: AppendCommitMigrationLog, AppendExtendedLogEntry, reply=%v", reply)
-		return reply
-	}
-	return RaftReplyOk
-}
-
 func (d *DirtyMgr) AppendRemoveNonDirtyChunksLog(raft *RaftInstance, fps []uint64) int32 {
 	if len(fps) == 0 {
 		return RaftReplyOk
 	}
-	reply := raft.AppendExtendedLogEntry(AppendEntryRemoveNonDirtyChunksCmdId, &common.RemoveNonDirtyChunksMsg{InodeKeys: fps})
+	reply := raft.AppendExtendedLogEntry(NewRemoveNonDirtyChunksCommand(fps))
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: AppendRemoveNonDirtyChunksLog, AppendExtendedLogEntry, reply=%v", reply)
 	}
 	return reply
 }
 
-func (d *DirtyMgr) ApplyAsRemoveNonDirtyChunks(extBuf []byte) int32 {
-	l := &common.RemoveNonDirtyChunksMsg{}
-	if err := proto.Unmarshal(extBuf, l); err != nil {
-		log.Errorf("Failed: ApplyAsRemoveNonDirtyChunks, Unmarshal, err=%v", err)
-		return ErrnoToReply(err)
-	}
+func (d *DirtyMgr) ApplyAsRemoveNonDirtyChunks(pm proto.Message) int32 {
+	l := pm.(*common.RemoveNonDirtyChunksMsg)
 	d.RemoveNonDirtyChunks(l.InodeKeys)
 	return RaftReplyOk
 }
@@ -741,20 +655,169 @@ func (d *DirtyMgr) ForgetAllDirty() {
 	d.migratingLock.Unlock()
 }
 
-func (d *DirtyMgr) ApplyAsForgetAllDirty(extBuf []byte) int32 {
-	l := &common.ForgetAllDirtyLogArgs{}
-	if err := proto.Unmarshal(extBuf, l); err != nil {
-		log.Errorf("Failed: ApplyAsForgetAllDirty, Unmarshal, err=%v", err)
-		return ErrnoToReply(err)
-	}
-	d.ForgetAllDirty()
-	return RaftReplyOk
-}
-
 func (d *DirtyMgr) AppendForgetAllDirtyLog(raft *RaftInstance) int32 {
-	reply := raft.AppendExtendedLogEntry(AppendEntryForgetAllDirtyLogCmdId, &common.ForgetAllDirtyLogArgs{})
+	reply := raft.AppendExtendedLogEntry(NewForgetAllDirtyLogCommand())
 	if reply != RaftReplyOk {
 		log.Errorf("Failed: AppendForgetAllDirtyLog, AppendExtendedLogEntry, reply=%v", reply)
 	}
 	return reply
+}
+
+func (d *DirtyMgr) AddMigratedAddMetas(s *Snapshot) {
+	d.migratingLock.Lock()
+	mig, ok := d.migrating[s.migrationId]
+	if !ok {
+		mig = &common.MigrationMsg{}
+		d.migrating[s.migrationId] = mig
+	}
+	mig.AddMetas = append(mig.AddMetas, s.metas...)
+	mig.AddFiles = append(mig.AddFiles, s.files...)
+	mig.DirInodes = append(mig.DirInodes, s.dirents...)
+	d.migratingLock.Unlock()
+}
+
+func (d *DirtyMgr) AddMigratedRemoveMetas(migrationId MigrationId, inodeKeys []uint64, dirKeys []uint64) {
+	d.migratingLock.Lock()
+	mig, ok := d.migrating[migrationId]
+	if !ok {
+		mig = &common.MigrationMsg{}
+		d.migrating[migrationId] = mig
+	}
+	for _, inodeKey := range inodeKeys {
+		mig.RemoveDirtyInodeIds = append(mig.RemoveDirtyInodeIds, uint64(inodeKey))
+	}
+	for _, inodeKey := range dirKeys {
+		mig.RemoveDirInodeIds = append(mig.RemoveDirInodeIds, uint64(inodeKey))
+	}
+	d.migratingLock.Unlock()
+}
+
+func (d *DirtyMgr) AddMigratedAddChunk(migrationId MigrationId, chunk *common.AppendCommitUpdateChunksMsg) {
+	d.migratingLock.Lock()
+	mig, ok := d.migrating[migrationId]
+	if !ok {
+		mig = &common.MigrationMsg{}
+		d.migrating[migrationId] = mig
+	}
+	mig.AddChunks = append(mig.AddChunks, chunk)
+	d.migratingLock.Unlock()
+}
+
+func (d *DirtyMgr) AddMigratedRemoveChunk(migrationId MigrationId, chunks []*common.ChunkRemoveDirtyMsg) {
+	d.migratingLock.Lock()
+	mig, ok := d.migrating[migrationId]
+	if !ok {
+		mig = &common.MigrationMsg{}
+		d.migrating[migrationId] = mig
+	}
+	mig.RemoveDirtyChunks = append(mig.RemoveDirtyChunks, chunks...)
+	d.migratingLock.Unlock()
+}
+
+type Snapshot struct {
+	metas       []*common.CopiedMetaMsg
+	mIdx        int
+	files       []*common.InodeToFileMsg
+	fIdx        int
+	dirents     []*common.InodeTreeMsg
+	dIdx        int
+	dirtyMetas  []*common.DirtyMetaInfoMsg
+	dmIdx       int
+	dirtyChunks []*common.AppendCommitUpdateChunksMsg
+	dcIdx       int
+	nodeList    *common.RaftNodeListMsg
+	nIdx        int
+
+	migrationId MigrationId
+	newExtLogId uint32
+	maxBytes    int
+}
+
+func NewSnapshot(maxBytes int, migrationId MigrationId, newExtLogId uint32,
+	metas []*common.CopiedMetaMsg,
+	files []*common.InodeToFileMsg,
+	dirents []*common.InodeTreeMsg,
+	dirtyMetas []*common.DirtyMetaInfoMsg,
+	dirtyChunks []*common.AppendCommitUpdateChunksMsg,
+	nodeList *common.RaftNodeListMsg) *Snapshot {
+
+	// NOTE: we need to record all metadata including non-dirty ones because we may encouter a race condition of PrepareUpdateMeta vs. Snapshot.
+	// In that case, PrepareUpdateMeta() falsely returns ENOENT at the error path for inode.meta == nil.
+	// PrepareUpdateMeta() may update non-dirty metadata but it cannot fetch from S3 due to the lack of information of accessed inodes (fetch keys, etc.)
+	// also we do not want to send such redundant information just for a very tiny race condition at every update during write().
+	ret := &Snapshot{
+		migrationId: migrationId, newExtLogId: newExtLogId, mIdx: 0, fIdx: 0, dIdx: 0, dmIdx: 0, nIdx: 0, maxBytes: maxBytes, nodeList: nodeList,
+		metas: metas, files: files, dirents: dirents, dirtyMetas: dirtyMetas, dirtyChunks: dirtyChunks,
+	}
+	if nodeList == nil {
+		ret.nIdx = 1
+	}
+	return ret
+}
+
+func NewSnapshotFromMsg(msg *common.SnapshotMsg) *Snapshot {
+	var nodeList *common.RaftNodeListMsg
+	if nodeListMsg := msg.GetNodeList(); len(nodeListMsg) > 0 {
+		nodeList = nodeListMsg[0]
+	}
+	migrationId := NewMigrationIdFromMsg(msg.GetMigrationId())
+	return NewSnapshot(math.MaxInt, migrationId, msg.GetNewExtLogId(), msg.GetMetas(), msg.GetFiles(), msg.GetDirents(), msg.GetDirtyMetas(), msg.GetDirtyChunks(), nodeList)
+}
+
+func (s *Snapshot) GetNext() *Snapshot {
+	if s.mIdx >= len(s.metas) && s.fIdx >= len(s.files) && s.dIdx >= len(s.dirents) && s.dmIdx >= len(s.dirtyMetas) && s.dcIdx >= len(s.dirtyChunks) && s.nIdx >= 1 {
+		return nil
+	}
+	ret := &common.SnapshotMsg{MigrationId: s.migrationId.toMsg(), NewExtLogId: s.newExtLogId}
+	lastmIdx := s.mIdx
+	lastfIdx := s.fIdx
+	lastdIdx := s.dIdx
+	lastdmIdx := s.dmIdx
+	lastdcIdx := s.dcIdx
+	lastnIdx := s.nIdx
+	for attempt := 1; attempt == 1 || proto.Size(ret) > s.maxBytes; attempt += 1 {
+		if lastmIdx = len(s.metas); s.mIdx < lastmIdx {
+			lastmIdx = s.mIdx + (lastmIdx-s.mIdx+attempt-1)/attempt
+			ret.Metas = s.metas[s.mIdx:lastmIdx]
+		}
+		if lastfIdx = len(s.files); s.fIdx < lastfIdx {
+			lastfIdx = s.fIdx + (lastfIdx-s.fIdx+attempt-1)/attempt
+			ret.Files = s.files[s.fIdx:lastfIdx]
+		}
+		if lastdIdx = len(s.dirents); s.dIdx < lastdIdx {
+			lastdIdx = s.dIdx + (lastdIdx-s.dIdx+attempt-1)/attempt
+			ret.Dirents = s.dirents[s.dIdx:lastdIdx]
+		}
+		if lastdmIdx = len(s.dirtyMetas); s.dmIdx < lastdmIdx {
+			lastdmIdx = s.dmIdx + (lastdmIdx-s.dmIdx+attempt-1)/attempt
+			ret.DirtyMetas = s.dirtyMetas[s.dmIdx:lastdmIdx]
+		}
+		if lastdcIdx = len(s.dirtyChunks); s.dcIdx < lastdcIdx {
+			lastdcIdx = s.dcIdx + (lastdcIdx-s.dcIdx+attempt-1)/attempt
+			ret.DirtyChunks = s.dirtyChunks[s.dcIdx:lastdcIdx]
+		}
+		if lastnIdx = 1; s.nIdx < lastnIdx {
+			ret.NodeList = []*common.RaftNodeListMsg{s.nodeList}
+		}
+		if attempt > 1 && lastmIdx <= s.mIdx+1 && lastfIdx <= s.fIdx+1 && lastdIdx <= s.dIdx+1 && lastdmIdx <= s.mIdx+1 && lastdcIdx <= s.dcIdx+1 {
+			break
+		}
+	}
+	s.mIdx = lastmIdx
+	s.fIdx = lastfIdx
+	s.dIdx = lastdIdx
+	s.dmIdx = lastdmIdx
+	s.dcIdx = lastdcIdx
+	s.nIdx = lastnIdx
+	return NewSnapshotFromMsg(ret)
+}
+
+func (s *Snapshot) toMsg() *common.SnapshotMsg {
+	ret := &common.SnapshotMsg{
+		MigrationId: s.migrationId.toMsg(), NewExtLogId: s.newExtLogId, Metas: s.metas, Files: s.files, Dirents: s.dirents, DirtyMetas: s.dirtyMetas, DirtyChunks: s.dirtyChunks,
+	}
+	if s.nodeList != nil {
+		ret.NodeList = []*common.RaftNodeListMsg{s.nodeList}
+	}
+	return ret
 }

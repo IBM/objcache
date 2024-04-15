@@ -42,13 +42,13 @@ common/types.pb.go: common/types.proto
 bin/objcache-client: $(CLIENT_GO_FILES) $(PROTO_FILES)
 	CGO_ENABLED=0 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache-client ./cmd/objcache-client/
 bin/objcache-fuse: $(FUSE_GO_FILES) $(PROTO_FILES)
-	CGO_ENABLED=1 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache-fuse ./cmd/objcache-fuse/
+	CGO_ENABLED=0 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache-fuse ./cmd/objcache-fuse/
 bin/objcache-csi-controller: $(CSI_CTONROLLER_GO_FILES) $(CORE_FILES) $(PROTO_FILES)
-	CGO_ENABLED=1 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache-csi-controller ./cmd/objcache-csi-controller
+	CGO_ENABLED=0 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache-csi-controller ./cmd/objcache-csi-controller
 bin/objcache-csi-node: $(CSI_NODE_GO_FILES) $(CORE_FILES) $(PROTO_FILES)
-	CGO_ENABLED=1 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache-csi-node ./cmd/objcache-csi-node
+	CGO_ENABLED=0 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache-csi-node ./cmd/objcache-csi-node
 bin/objcache: $(NOFS_GO_FILES) $(CORE_FILES) $(PROTO_FILES)
-	CGO_ENABLED=1 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache ./cmd/objcache
+	CGO_ENABLED=0 GOOS=linux go build -v -a $(LD_FLAGS) $(GC_FLAGS) -o bin/objcache ./cmd/objcache
 
 proto: api/objcache.pb.go common/types.pb.go
 objcache: bin/objcache
@@ -75,7 +75,35 @@ crd: operator operator/bin/kustomize
 operator-yaml: operator
 	cd ./operator/config/manager && ../../bin/kustomize edit set image controller=${OPERATOR_IMAGE_TAG}
 	./operator/bin/kustomize build operator/config/default > deploy/kubernetes/operator.yaml
+operator-yaml: deploy/kubernetes/crd.yaml deploy/kubernetes/operator.yaml deploy/kubernetes/namespace.yaml
 container: c_csi-controller c_csi-node c_objcache c_operator crd operator-yaml
+
+OPERATOR_NAMESPACE = objcache-operator-system
+OPERATOR_NAMEPREFIX = objcache-operator-
+
+deploy/kubernetes/operator-all.yaml: ## Deploy controller to the K8s cluster specified in ~/.kube/config.
+	cd operator/config/manager && cp kustomization.yaml .kustomization.yaml.orig && \
+	../../bin/kustomize edit set image controller=${OPERATOR_IMAGE_TAG}
+	./operator/bin/kustomize build operator/config/default > deploy/kubernetes/operator-all.yaml && \
+	mv operator/config/manager/.kustomization.yaml.orig operator/config/manager/kustomization.yaml
+
+deploy/kubernetes/crd.yaml:
+	./operator/bin/kustomize build operator/config/crd > deploy/kubernetes/crd.yaml
+
+deploy/kubernetes/operator.yaml:
+	cd operator/config/manager-only && cp kustomization.yaml .kustomization.yaml.orig && \
+	../../bin/kustomize edit set image controller=${OPERATOR_IMAGE_TAG} && \
+	../../bin/kustomize edit set namespace $(OPERATOR_NAMESPACE) && \
+	../../bin/kustomize edit set nameprefix ${OPERATOR_NAMEPREFIX} && \
+	../../bin/kustomize build . > ../../../deploy/kubernetes/operator.yaml && \
+	mv .kustomization.yaml.orig kustomization.yaml
+
+deploy/kubernetes/namespace.yaml:
+	cd operator/config/namespace && cp kustomization.yaml .kustomization.yaml.orig && \
+	../../bin/kustomize edit set nameprefix ${OPERATOR_NAMEPREFIX} && \
+	../../bin/kustomize edit set namespace $(OPERATOR_NAMESPACE) && \
+	../../bin/kustomize build . > ../../../deploy/kubernetes/namespace.yaml && \
+	mv .kustomization.yaml.orig kustomization.yaml
 
 p_csi-controller: c_csi-controller
 	docker push $(CONTROLLER_IMAGE_TAG)

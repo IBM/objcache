@@ -2,6 +2,7 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
@@ -17,6 +18,7 @@ import (
 
 type MetaRWHandler struct {
 	inodeKey  InodeKeyType
+	fetchKey  string
 	version   uint32
 	size      int64
 	chunkSize int64
@@ -24,20 +26,25 @@ type MetaRWHandler struct {
 	mode      uint32
 }
 
-func NewMetaRWHandler(inodeKey InodeKeyType, version uint32, size int64, chunkSize int64, mTime int64, mode uint32) MetaRWHandler {
-	return MetaRWHandler{inodeKey: inodeKey, version: version, size: size, chunkSize: chunkSize, mTime: mTime, mode: mode}
-}
-
 func NewMetaRWHandlerFromMeta(meta *WorkingMeta) MetaRWHandler {
-	return NewMetaRWHandler(meta.inodeKey, meta.version, meta.size, meta.chunkSize, meta.mTime, meta.mode)
+	return MetaRWHandler{
+		inodeKey: meta.inodeKey, fetchKey: meta.fetchKey,
+		version: meta.version, size: meta.size, chunkSize: meta.chunkSize, mTime: meta.mTime, mode: meta.mode,
+	}
 }
 
 func NewMetaRWHandlerFromMsg(msg *common.MetaRWHandlerMsg) MetaRWHandler {
-	return MetaRWHandler{inodeKey: InodeKeyType(msg.GetInodeKey()), version: msg.GetVersion(), size: msg.GetSize(), chunkSize: msg.GetChunkSize(), mTime: msg.GetMTime(), mode: msg.GetMode()}
+	return MetaRWHandler{
+		inodeKey: InodeKeyType(msg.GetInodeKey()), fetchKey: msg.GetFetchKey(),
+		version: msg.GetVersion(), size: msg.GetSize(), chunkSize: msg.GetChunkSize(), mTime: msg.GetMTime(), mode: msg.GetMode(),
+	}
 }
 
 func (m MetaRWHandler) toMsg() *common.MetaRWHandlerMsg {
-	return &common.MetaRWHandlerMsg{InodeKey: uint64(m.inodeKey), Version: m.version, Size: m.size, ChunkSize: m.chunkSize, MTime: m.mTime, Mode: m.mode}
+	return &common.MetaRWHandlerMsg{
+		InodeKey: uint64(m.inodeKey), FetchKey: m.fetchKey,
+		Version: m.version, Size: m.size, ChunkSize: m.chunkSize, MTime: m.mTime, Mode: m.mode,
+	}
 }
 
 type FileHandle struct {
@@ -71,7 +78,7 @@ func (i *FileHandle) dropAllNoLock(n *NodeServer) {
 	n.localHistory.Delete(i.h.inodeKey)
 }
 
-func (i *FileHandle) ReadNoCache(key string, offset int64, size int64, n *NodeServer, op interface{}) (data [][]byte, count int, errno error) {
+func (i *FileHandle) ReadNoCache(offset int64, size int64, n *NodeServer, op interface{}) (data [][]byte, count int, errno error) {
 	begin := time.Now()
 	for atomic.LoadInt32(&i.dirty) != 0 {
 		_, err := i.Flush(n)
@@ -92,7 +99,7 @@ func (i *FileHandle) ReadNoCache(key string, offset int64, size int64, n *NodeSe
 			lastOffset := (offset + int64(count)) - chunkOff + n.flags.CosPrefetchSizeBytes
 			if lastPrefetchOff+n.flags.CosPrefetchSizeBytes/2 <= lastOffset && atomic.CompareAndSwapInt64(&i.prefetchOffset, lastPrefetchOff, lastOffset) {
 				prefetchBegin := time.Now()
-				n.prefetchChunkAny(h, key, lastPrefetchOff, lastOffset-lastPrefetchOff)
+				n.PrefetchChunk(h, lastPrefetchOff, lastOffset-lastPrefetchOff)
 				prefetchTime += time.Since(prefetchBegin)
 			}
 		}
@@ -100,7 +107,7 @@ func (i *FileHandle) ReadNoCache(key string, offset int64, size int64, n *NodeSe
 		if length > size-int64(count) {
 			length = size - int64(count)
 		}
-		buf, c, err := n.VectorReadChunk(h, key, offset+int64(count), int(length), true)
+		buf, c, err := n.ReadChunk(h, offset+int64(count), int(length), true)
 		if err == io.EOF || c == 0 {
 			break
 		} else if err != nil {
@@ -127,12 +134,12 @@ func (i *FileHandle) ReadNoCache(key string, offset int64, size int64, n *NodeSe
 	if offset+int64(count) < h.size && int64(count) != size {
 		log.Warnf("ReadNoCache, Something bad happens!!!!, count (%v) != size (%v)", count, size)
 	}
-	log.Debugf("Success: FileHandle.ReadNoCache, key=%v, offset=%v, size=%v, len(data)=%v, prefetch=%v, elapsed=%v",
-		key, offset, size, len(data), prefetchTime, time.Since(begin))
+	log.Debugf("Success: FileHandle.ReadNoCache, fetchKey=%v, offset=%v, size=%v, len(data)=%v, prefetch=%v, elapsed=%v",
+		h.fetchKey, offset, size, len(data), prefetchTime, time.Since(begin))
 	return
 }
 
-func (i *FileHandle) Read(key string, offset int64, size int64, n *NodeServer, op interface{}) (data [][]byte, count int, errno error) {
+func (i *FileHandle) Read(offset int64, size int64, n *NodeServer, op interface{}) (data [][]byte, count int, errno error) {
 	begin := time.Now()
 	for atomic.LoadInt32(&i.dirty) != 0 {
 		_, err := i.Flush(n)
@@ -155,7 +162,7 @@ func (i *FileHandle) Read(key string, offset int64, size int64, n *NodeServer, o
 			lastOffset := alignedOffset + n.flags.CosPrefetchSizeBytes
 			if lastPrefetchOff+n.flags.CosPrefetchSizeBytes/2 <= lastOffset && atomic.CompareAndSwapInt64(&i.prefetchOffset, lastPrefetchOff, lastOffset) {
 				prefetchBegin := time.Now()
-				n.prefetchChunkAny(h, key, lastPrefetchOff, lastOffset-lastPrefetchOff)
+				n.PrefetchChunk(h, lastPrefetchOff, lastOffset-lastPrefetchOff)
 				prefetchTime += time.Since(prefetchBegin)
 			}
 		}
@@ -164,7 +171,7 @@ func (i *FileHandle) Read(key string, offset int64, size int64, n *NodeServer, o
 			length = h.chunkSize
 		}
 		blocking := len(flying) == 0 || int64(count) < size
-		buf, c, err := n.VectorReadChunk(h, key, alignedOffset, int(length), blocking)
+		buf, c, err := n.ReadChunk(h, alignedOffset, int(length), blocking)
 		if err == io.EOF || (!blocking && err == unix.EAGAIN) || c == 0 {
 			break
 		} else if err != nil {
@@ -172,7 +179,7 @@ func (i *FileHandle) Read(key string, offset int64, size int64, n *NodeServer, o
 			for _, b := range flying {
 				b.SetEvictable()
 			}
-			log.Errorf("Failed: FileHandle.Read, VectorReadChunk, alignedOffset=%v, length=%v, err=%v", alignedOffset, length, err)
+			log.Errorf("Failed: FileHandle.Read, ReadChunk, alignedOffset=%v, length=%v, err=%v", alignedOffset, length, err)
 			return nil, 0, err
 		}
 		flying = append(flying, buf...)
@@ -220,14 +227,14 @@ func (i *FileHandle) Read(key string, offset int64, size int64, n *NodeServer, o
 	if offset+int64(count) < h.size && int64(count) != size {
 		log.Warnf("Read, Something bad happens!!!!, count (%v) != size (%v)", count, size)
 	}
-	log.Debugf("Success: FileHandle.Read, key=%v, offset=%v, size=%v, len(data)=%v, prefetch=%v, elapsed=%v",
-		key, offset, size, len(data), prefetchTime, time.Since(begin))
+	log.Debugf("Success: FileHandle.Read, fetchKey=%v, offset=%v, size=%v, len(data)=%v, prefetch=%v, elapsed=%v",
+		h.fetchKey, offset, size, len(data), prefetchTime, time.Since(begin))
 
 	if !n.flags.DisableLocalWritebackCaching && n.flags.ClientReadAheadSizeBytes > 0 {
 		lastReadAheadOff := atomic.LoadInt64(&i.readAheadOffset)
 		lastOffset := offset + int64(count) + n.flags.ClientReadAheadSizeBytes
 		if lastReadAheadOff+n.flags.ClientReadAheadSizeBytes/2 <= lastOffset && atomic.CompareAndSwapInt64(&i.readAheadOffset, lastReadAheadOff, lastOffset) {
-			n.ReadAheadChunk(h, key, offset+int64(count), lastOffset-lastReadAheadOff)
+			n.ReadAheadChunk(h, offset+int64(count), lastOffset-lastReadAheadOff)
 		}
 	}
 	return
@@ -242,34 +249,6 @@ func (i *FileHandle) ReleaseFlyingBuffer(op interface{}) {
 		buf.SetEvictable() // unblock auto-eviction
 	}
 }
-
-/*func (i *FileHandle) ReadMinimum(key string, offset int64, data []byte, n *NodeServer) (count int, errno error) {
-	for atomic.LoadInt32(&i.dirty) != 0 {
-		_, err := i.Flush(n)
-		if err != nil {
-			return 0, err
-		}
-	}
-	i.lock.RLock()
-	h := i.h
-	i.lock.RUnlock()
-	if offset%h.chunkSize == 0 && n.flags.CosPrefetchSizeBytes > 0 {
-		n.prefetchChunkAny(h, key, offset)
-	}
-	for count < len(data) && offset+int64(count) < h.size {
-		_, c, err := n.ReadChunk(h, key, offset+int64(count), data[count:])
-		if err != nil {
-			log.Errorf("Failed: FileHandle.ReadMinimum, ReadChunk, offset=%v, count=%v, len(data)=%v, err=%v", offset, count, len(data), err)
-			errno = err
-			break
-		}
-		if c == 0 {
-			break
-		}
-		count += c
-	}
-	return
-}*/
 
 func (i *FileHandle) appendRecords(records []*common.UpdateChunkRecordMsg) {
 	for _, record := range records {
@@ -298,9 +277,9 @@ func (i *FileHandle) Write(offset int64, data []byte, n *NodeServer) (meta *Work
 	i.lock.RUnlock()
 	firstLock := time.Now()
 	count := int64(len(data))
-	records, reply := n.updateChunksAny(h.inodeKey, h.chunkSize, offset, count, data)
+	records, reply := n.WriteChunk(h.inodeKey, h.chunkSize, offset, count, data)
 	if reply != RaftReplyOk {
-		log.Errorf("Failed: FileHandle.Write, updateChunksAny, inodeKey=%v, reply=%v", h.inodeKey, reply)
+		log.Errorf("Failed: FileHandle.Write, WriteChunk, inodeKey=%v, reply=%v", h.inodeKey, reply)
 		i.abort(records, n)
 		return nil, ReplyToFuseErr(reply)
 	}

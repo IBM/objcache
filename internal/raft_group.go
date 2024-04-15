@@ -2,6 +2,7 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
@@ -17,7 +18,6 @@ import (
 	"github.com/spaolacci/murmur3"
 	"github.com/IBM/objcache/api"
 	"github.com/IBM/objcache/common"
-	"google.golang.org/protobuf/proto"
 )
 
 type RaftNode struct {
@@ -76,6 +76,16 @@ func NewRaftNodeList(ring *hashring.HashRing, version uint64) *RaftNodeList {
 		nodeAddr: make(map[uint32]common.NodeAddrInet4), groupNode: make(map[string]map[uint32]RaftNode),
 		ring: ring, version: version,
 	}
+}
+
+func (l *RaftNodeList) toMsg() *common.RaftNodeListMsg {
+	ret := &common.RaftNodeListMsg{Nodes: make([]*common.NodeMsg, 0), Version: l.version}
+	for _, nodes := range l.groupNode {
+		for _, node := range nodes {
+			ret.Nodes = append(ret.Nodes, node.toMsg())
+		}
+	}
+	return ret
 }
 
 func (r *RaftNodeList) CheckReset() (ok bool) {
@@ -169,14 +179,19 @@ func NewRaftGroupMgr(groupId string, nrVirt int) *RaftGroupMgr {
 	return ret
 }
 
-func NewRaftGroupMgrFromMsg(groupId string, nrVirt int, msg *common.RaftGroupMgrSnapshotMsg) *RaftGroupMgr {
-	ret := NewRaftGroupMgr(groupId, nrVirt)
-	ret.nodeList = NewRaftNodeListFromMsg(nrVirt, msg.GetNodeList())
-	for _, nodeMsg := range msg.GetLeaders() {
-		node := NewRaftNodeFromMsg(nodeMsg)
-		ret.leaderCache[node.groupId] = node
+func (m *RaftGroupMgr) ResetWithRaftNodeListMsg(msg *common.RaftNodeListMsg) {
+	m.lock.Lock()
+	m.nodeList = NewRaftNodeListFromMsg(m.nrVirt, msg)
+	m.lock.Unlock()
+	m.leaderLock.Lock()
+	m.leaderCache = make(map[string]RaftNode)
+	for _, nodes := range m.nodeList.groupNode {
+		for _, node := range nodes {
+			m.leaderCache[node.groupId] = node
+			break
+		}
 	}
-	return ret
+	m.leaderLock.Unlock()
 }
 
 func (m *RaftGroupMgr) Clean() {
@@ -348,11 +363,10 @@ func (m *RaftGroupMgr) copyNodeListNoLock(ring *hashring.HashRing) *RaftNodeList
 	return newNodeList
 }
 
-func (m *RaftGroupMgr) Add(msg *common.NodeMsg) {
-	node := NewRaftNodeFromMsg(msg)
+func (m *RaftGroupMgr) Add(node RaftNode) {
 	m.lock.Lock()
 	var newNodeList *RaftNodeList
-	if _, ok := m.nodeList.groupNode[msg.GroupId]; ok {
+	if _, ok := m.nodeList.groupNode[node.groupId]; ok {
 		newNodeList = m.copyNodeListNoLock(m.nodeList.ring)
 	} else {
 		newNodeList = m.copyNodeListNoLock(m.nodeList.ring.AddWeightedNode(node.groupId, m.nrVirt))
@@ -399,6 +413,24 @@ func (m *RaftGroupMgr) Remove(nodeId uint32, groupId string) {
 	log.Infof("Success: RaftGroupMgr.Remove, nodeId=%v, groupId=%v, newVer=%v", nodeId, groupId, newNodeList.version)
 }
 
+func (m *RaftGroupMgr) CommitUpdate(nodes []RaftNode, isAdd bool, nodeListVer uint64) {
+	if isAdd {
+		for _, node := range nodes {
+			m.Add(node)
+		}
+	} else {
+		for _, node := range nodes {
+			m.Remove(node.nodeId, node.groupId)
+		}
+	}
+	m.lock.Lock()
+	if nodeListVer > 0 && m.nodeList != nil && m.nodeList.version != nodeListVer {
+		m.nodeList.version = nodeListVer
+		log.Debugf("Success: RaftGroupMgr.CommitUpdate, overwrite nodeListVer=%v", nodeListVer)
+	}
+	m.lock.Unlock()
+}
+
 func (m *RaftGroupMgr) SetNodeListDirect(nodes []*api.ApiNodeMsg, nodeListVer uint64) {
 	// only clients can call this method. servers must use raft.AppendExtendedLogEntry(AppendEntryUpdateNodeListLocalCmdId, ...)
 	newNodeList := NewRaftNodeList(hashring.NewWithHash([]string{}, MyHashFunc), nodeListVer)
@@ -421,32 +453,32 @@ func (m *RaftGroupMgr) SetNodeListDirect(nodes []*api.ApiNodeMsg, nodeListVer ui
 	m.leaderLock.Unlock()
 }
 
-// ApplyAsUpdateNodeListLocal this appends a new server with a group (the group can be duplicated in the existing entry)
-func (m *RaftGroupMgr) ApplyAsUpdateNodeListLocal(extBuf []byte) int32 {
-	l := &common.UpdateNodeListMsg{}
-	if err := proto.Unmarshal(extBuf, l); err != nil {
-		log.Errorf("Failed: ApplyAsUpdateNodeListLocal, Unmarshal, err=%v", err)
-		return ErrnoToReply(err)
-	}
-	if l.IsAdd {
-		for _, node := range l.GetNodes().GetServers() {
+// UpdateNodeListLocal appends a new server with a group (the group can be duplicated in the existing entry)
+func (m *RaftGroupMgr) UpdateNodeListLocal(isAdd bool, nodes []RaftNode, nodeListVer uint64) {
+	if isAdd {
+		for _, node := range nodes {
 			m.Add(node)
-			log.Debugf("Success: ApplyAsUpdateNodeListLocal (Add Server), Node=%v", node)
+			log.Debugf("Success: UpdateNodeListLocal (Add Server), Node=%v", node)
 		}
 	} else {
-		for _, node := range l.GetNodes().GetServers() {
-			m.Remove(node.GetNodeId(), node.GetGroupId())
-			log.Debugf("Success: ApplyAsUpdateNodeListLocal (Remove Server), Node=%v", node)
+		for _, node := range nodes {
+			m.Remove(node.nodeId, node.groupId)
+			log.Debugf("Success: UpdateNodeListLocal (Remove Server), Node=%v", node)
 		}
 	}
-	ver := l.GetNodeListVer()
 	m.lock.Lock()
-	if ver > 0 && m.nodeList != nil && m.nodeList.version != ver {
-		m.nodeList.version = ver // only called by RequestJoinLocal after Rejuvenation
-		log.Debugf("Success: ApplyAsUpdateNodeListLocal, overwrite nodeListVer=%v", ver)
+	if nodeListVer > 0 && m.nodeList != nil && m.nodeList.version != nodeListVer {
+		m.nodeList.version = nodeListVer // only called by RequestJoinLocal after Rejuvenation
+		log.Debugf("Success: UpdateNodeListLocal, overwrite nodeListVer=%v", nodeListVer)
 	}
 	m.lock.Unlock()
-	return RaftReplyOk
+}
+
+func (m *RaftGroupMgr) GetChunkOwnerGroupId(inodeKey InodeKeyType, offset int64, chunkSize int64) (string, bool) {
+	m.lock.RLock()
+	groupId, ok := GetGroupForChunk(m.nodeList.ring, inodeKey, offset, chunkSize)
+	m.lock.RUnlock()
+	return groupId, ok
 }
 
 // Last two arguments are reserved for clientId and seqNum
@@ -456,7 +488,7 @@ func (m *RaftGroupMgr) getChunkOwnerNodeLocal(inodeKey InodeKeyType, offset int6
 	groupId, ok := GetGroupForChunk(nodeList.ring, inodeKey, offset, chunkSize)
 	if !ok {
 		m.lock.RUnlock()
-		log.Errorf("Failed: RaftGroupMgr.getChunkOwnerNodeLocal, GetNode, not found, inodeKey=%v", inodeKey)
+		log.Errorf("Failed: RaftGroupMgr.getChunkOwnerNodeLocal, GetGroupForChunk, not found, inodeKey=%v", inodeKey)
 		reply = RaftReplyNoGroup
 		return
 	}

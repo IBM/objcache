@@ -175,6 +175,9 @@ func (r *ObjcacheClusterReconciler) UpdateCluster(ctx context.Context, objcache 
 		objcache.Status.RaftFollowers = objcache.Spec.RaftFollowers
 		update = true
 	}
+	if currentStartedReplicas < *objcache.Spec.Shards {
+		l.Info("scaling up", "currentStartedReplicas", currentStartedReplicas, "*objcache.Spec.Shards", *objcache.Spec.Shards)
+	}
 	for i := currentStartedReplicas; i < *objcache.Spec.Shards; i++ { // scaling up
 		if err = r.UpdateStatefulSet(ctx, objcache, l, i); err != nil {
 			goto tryUpdate
@@ -183,28 +186,33 @@ func (r *ObjcacheClusterReconciler) UpdateCluster(ctx context.Context, objcache 
 		objcache.Status.RaftFollowers = objcache.Spec.RaftFollowers
 		update = true
 	}
+	if currentStartedReplicas-1 >= 0 && currentStartedReplicas-1 > *objcache.Spec.Shards-1 {
+		l.Info("scaling down", "currentStartedReplicas", currentStartedReplicas, "*objcache.Spec.Shards", *objcache.Spec.Shards)
+	}
 	for i := currentStartedReplicas - 1; i >= 0 && i > *objcache.Spec.Shards-1; i-- { // scaling down
 		if err = r.DeleteStatefulSet(ctx, objcache, l, i); err != nil {
 			goto tryUpdate
 		}
-		for j := objcache.Status.RaftFollowers; j >= 0; j-- {
-			if err = r.DeleteStatefulSetVolume(ctx, objcache, l, i, j); err != nil {
-				return
-			}
-		}
 		objcache.Status.StartedShards = i
 		update = true
+		for j := objcache.Status.RaftFollowers; j >= 0; j-- {
+			if err2 := r.DeleteStatefulSetVolume(ctx, objcache, l, i, j); err2 != nil {
+				err = err2
+			}
+		}
+		if err != nil {
+			goto tryUpdate
+		}
 	}
-	if requeue, err = r.UpdateStorageClass(ctx, objcache, l); err != nil || requeue {
-		return
-	}
+	requeue, err = r.UpdateStorageClass(ctx, objcache, l)
 tryUpdate:
 	if update {
 		if err2 := r.Status().Update(ctx, objcache); err2 != nil {
 			return
 		}
+		l.Info("Success: Update objcache", "Shards", objcache.Status.StartedShards, "Followers", objcache.Status.RaftFollowers, "seed", objcache.Status.Seed)
 	}
-	return false, err
+	return requeue, err
 }
 
 func (r *ObjcacheClusterReconciler) UpdateConfigMap(ctx context.Context, objcache *trlv1alpha1.ObjcacheCluster, l logr.Logger) (bool, error) {

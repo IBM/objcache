@@ -571,7 +571,6 @@ func (r *ObjcacheCsiDriverReconciler) UpdateNodes(ctx context.Context, objcache 
 	if !hasObjcache {
 		command := []string{
 			"/objcache-csi-node", "--endpoint=unix:///csi/csi.sock", "--nodeId=$(NODE_ID)", "--externalIp=$(POD_IP)",
-			"--deploymentModel=isolated",
 			fmt.Sprintf("--rootDir=%v", objcache.Spec.LocalVolume.MountPath),
 			fmt.Sprintf("--driverName=%v", driverName),
 			fmt.Sprintf("--driverVersion=%v", objcacheVersion),

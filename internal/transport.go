@@ -2,6 +2,7 @@
  * Copyright 2023- IBM Inc. All rights reserved
  * SPDX-License-Identifier: Apache-2.0
  */
+
 package internal
 
 import (
@@ -25,22 +26,23 @@ const (
 )
 
 type ReadRpcMsgState struct {
-	cmdId               uint8
-	off                 uint16
-	optHeaderLength     uint16
-	optOff              uint16
-	optOffForSplice     uint16
-	bufOffForSplice     int32
-	fileOffsetForSplice int64
-	optComplete         int
-	abortFile           bool
-	completed           bool
-	failed              error
+	cmdId              uint8
+	off                uint16
+	optHeaderLength    uint16
+	optOff             uint16
+	optOffForSplice    uint16
+	bufOffForSplice    int32
+	vec                *DiskWriteVector
+	logOffsetForSplice int64
+	optComplete        int
+	abort              bool
+	completed          bool
+	failed             error
 }
 
 // ReadDataToRaftLog
 // Note: msg must be already filled by ReadRpcMsg
-func ReadDataToRaftLog(fd int, msg *RpcMsg, r *ReadRpcMsgState, files *RaftFiles, pipeFds [2]int) {
+func ReadDataToRaftLog(fd int, msg *RpcMsg, r *ReadRpcMsgState, extLogger *OnDiskLogger, pipeFds [2]int) {
 	if r.cmdId != AppendEntriesCmdId {
 		r.completed = true
 		return
@@ -53,64 +55,32 @@ func ReadDataToRaftLog(fd int, msg *RpcMsg, r *ReadRpcMsgState, files *RaftFiles
 			r.bufOffForSplice = 0
 			continue
 		}
-		bodyFileId, bodyLength, bodyOffset := GetAppendEntryFileArgs(extEntryPayload)
-		var rFd int
-		var err error
-		if r.abortFile {
-			rFd, err = unix.Open("/dev/null", unix.O_WRONLY, 0644)
-		} else {
-			rFd, err = files.Open(bodyFileId, unix.O_WRONLY|unix.O_CREAT)
-		}
-		if err != nil {
-			r.failed = err
-			log.Errorf("Failed: ReadDataToRaftLog, Open, bodyFileId=%v, err=%v", bodyFileId, err)
-			return
-		}
-		var count int64
-		for r.bufOffForSplice < bodyLength {
-			var nRead int64
-			nRead, err = unix.Splice(fd, nil, pipeFds[1], nil, int(bodyLength-r.bufOffForSplice), unix.SPLICE_F_MOVE|unix.SPLICE_F_NONBLOCK)
-			if err == unix.EAGAIN || nRead == 0 {
-				if count == 0 {
-					_ = unix.Close(rFd)
-					return
-				}
-				break
-			} else if err != nil {
+		bodyLogId, bodyLength, bodyOffset := GetAppendEntryExtLogArgs(extEntryPayload)
+		disk := extLogger.GetDiskLog(bodyLogId, 32, 16)
+		if r.vec == nil {
+			var err error
+			r.vec, err = disk.BeginRandomSplice(fd, int64(bodyLength), bodyOffset)
+			if err != nil {
 				r.failed = err
-				_ = unix.Close(rFd)
-				log.Errorf("Failed: ReadDataToRaftLog, Splice (0), nfd=%v, pipeFds[1]=%v, bodyLength=%v, err=%v", fd, pipeFds[1], bodyLength, err)
+				log.Errorf("Failed: ReadDataToRaftLog, BeginRandomSplice, bodyLogId=%v, err=%v", bodyLogId, err)
 				return
 			}
-			bodyOff := bodyOffset + int64(r.bufOffForSplice)
-			for nRead > 0 {
-				var l2 = int(nRead & int64(math.MaxInt))
-				var nWrite int64
-				nWrite, err = unix.Splice(pipeFds[0], nil, rFd, &bodyOff, l2, unix.SPLICE_F_MOVE)
-				if err != nil {
-					r.failed = err
-					_ = unix.Close(rFd)
-					log.Errorf("Failed: ReadDataToRaftLog, Splice (1), pipeFds[0]=%v, rFd=%v, l2=%v, offset=%v, err=%v", pipeFds[0], rFd, l2, bodyOff, err)
-					return
-				}
-				nRead -= nWrite
-				r.bufOffForSplice += int32(nWrite)
-				count += nWrite
-			}
 		}
-		if !r.abortFile {
-			files.SeekRange(bodyFileId, bodyOffset+count)
-		}
-		if err2 := unix.Fsync(rFd); err2 != nil {
-			log.Warnf("Failed (ignore): ReadDataToRaftLog, Fsync, rFd=%v, err=%v", rFd, err2)
-		}
-		/*if err2 := unix.Fadvise(rFd, bodyOffset, int64(bodyLength), unix.FADV_DONTNEED); err2 != nil {
-			log.Warnf("Failed (ignore): ReadDataToRaftLog, Fadvise, rFd=%v, err=%v", rFd, err2)
-		}*/
-		if err2 := unix.Close(rFd); err2 != nil {
-			log.Warnf("Failed (ignore): ReadDataToRaftLog, Close, rFd=%v, err=%v", rFd, err2)
+		if err := disk.Splice(r.vec, pipeFds, &r.bufOffForSplice); err != nil {
+			r.failed = err
+			r.vec = nil
+			log.Errorf("Failed: ReadDataToRaftLog, Splice, bodyLogId=%v, bufOffForSplice=%v, err=%v", bodyLogId, r.bufOffForSplice, err)
+			return
 		}
 		if r.bufOffForSplice == bodyLength {
+			sizeIncrease, err := disk.EndWrite(r.vec)
+			extLogger.PutDiskLog(bodyLogId, r.vec, sizeIncrease)
+			if err != nil {
+				r.failed = err
+				r.vec = nil
+				log.Errorf("Failed: ReadDataToRaftLog, Splice, bodyLogId=%v, bufOffForSplice=%v, err=%v", bodyLogId, r.bufOffForSplice, err)
+				return
+			}
 			r.optOffForSplice = nextOff
 			r.bufOffForSplice = 0
 		}
@@ -121,7 +91,7 @@ func ReadDataToRaftLog(fd int, msg *RpcMsg, r *ReadRpcMsgState, files *RaftFiles
 func ReadDataToBuffer(fd int, msg *RpcMsg, r *ReadRpcMsgState, data []byte) {
 	payload := msg.GetCmdPayload()
 	rpcId := msg.GetExecProtoBufRpcId(payload)
-	if rpcId != RpcDownloadChunkViaRemoteCmdId {
+	if rpcId != RpcReadChunkCmdId {
 		r.completed = true
 		return
 	}
@@ -139,7 +109,7 @@ func ReadDataToBuffer(fd int, msg *RpcMsg, r *ReadRpcMsgState, data []byte) {
 		if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 			break
 		} else if err != nil {
-			log.Errorf("Failed: ReadDataToBuffer, Pread, err=%v", err)
+			log.Errorf("Failed: ReadDataToBuffer, Read, err=%v", err)
 			return
 		}
 		if nRead == 0 {
@@ -153,7 +123,7 @@ func ReadDataToBuffer(fd int, msg *RpcMsg, r *ReadRpcMsgState, data []byte) {
 func ReadDataToFd(fd int, msg *RpcMsg, r *ReadRpcMsgState, toFd int, pipeFds [2]int) {
 	payload := msg.GetCmdPayload()
 	rpcId := msg.GetExecProtoBufRpcId(payload)
-	if rpcId != RpcDownloadChunkViaRemoteCmdId {
+	if rpcId != RpcReadChunkCmdId {
 		r.completed = true
 		return
 	}
@@ -166,17 +136,17 @@ func ReadDataToFd(fd int, msg *RpcMsg, r *ReadRpcMsgState, toFd int, pipeFds [2]
 			break
 		} else if err != nil {
 			r.failed = err
-			log.Errorf("Failed: ReadDataToTempFile, Splice (0), nfd=%v, pipeFds[1]=%v, bodyLength=%v, err=%v", fd, pipeFds[1], dataLength, err)
+			log.Errorf("Failed: ReadDataToFd, Splice (0), nfd=%v, pipeFds[1]=%v, bodyLength=%v, err=%v", fd, pipeFds[1], dataLength, err)
 			return
 		}
-		bodyOff := r.fileOffsetForSplice + int64(r.bufOffForSplice)
+		bodyOff := r.logOffsetForSplice + int64(r.bufOffForSplice)
 		for nRead > 0 {
 			var l2 = int(nRead & int64(math.MaxInt))
 			var nWrite int64
 			nWrite, err = unix.Splice(pipeFds[0], nil, toFd, &bodyOff, l2, unix.SPLICE_F_MOVE)
 			if err != nil {
 				r.failed = err
-				log.Errorf("Failed: ReadDataToTempFile, Splice (1), pipeFds[0]=%v, toFd=%v, l2=%v, offset=%v, err=%v", pipeFds[0], toFd, l2, bodyOff, err)
+				log.Errorf("Failed: ReadDataToFd, Splice (1), pipeFds[0]=%v, toFd=%v, l2=%v, offset=%v, err=%v", pipeFds[0], toFd, l2, bodyOff, err)
 				return
 			}
 			nRead -= nWrite
@@ -238,16 +208,14 @@ type WriteRpcState struct {
 	optHeaderLength    uint16
 }
 
-// __writeRpcMsg: if files == nil, skip sending files
-func __writeRpcMsg(ev unix.EpollEvent, fd int, state *WriteRpcState, files *RaftFiles, dataBuf [][]byte, debug bool) error {
+// __writeRpcMsg: if extLogger == nil, skip sending extLogger
+func __writeRpcMsg(ev unix.EpollEvent, fd int, state *WriteRpcState, extLogger *OnDiskLogger, dataBuf [][]byte, debug bool) error {
 	if state.completed || state.failed != nil {
 		return nil
 	}
-	var sendFileBytes int
 	var writeTime time.Duration
 	var writeOptTime time.Duration
 	var writeDataTime time.Duration
-	var sendFileTime time.Duration
 	cmdId := state.msg.GetCmdId()
 	if ev.Events&unix.EPOLLERR != 0 || ev.Events&unix.EPOLLHUP != 0 || ev.Events&unix.EPOLLIN != 0 {
 		// a peer closed the socket (EPOLLHUP), something bad happened (EPOLLERR), or unexpected events are reported. delete it from the epoll list
@@ -300,8 +268,8 @@ func __writeRpcMsg(ev unix.EpollEvent, fd int, state *WriteRpcState, files *Raft
 			state.failed = nil
 		}
 		if state.completed && debug {
-			log.Debugf("Success: __writeRpcMsg, writeTime=%v (bytes=%v), writeOptTime=%v (bytes=%v), sendFileTime=%v (bytes=%v)",
-				writeTime, state.headerSentBytes, writeOptTime, state.optHeaderSentBytes, sendFileTime, sendFileBytes)
+			log.Debugf("Success: __writeRpcMsg, writeTime=%v (bytes=%v), writeOptTime=%v (bytes=%v)",
+				writeTime, state.headerSentBytes, writeOptTime, state.optHeaderSentBytes)
 		}
 		return nil
 	}
@@ -312,32 +280,13 @@ func __writeRpcMsg(ev unix.EpollEvent, fd int, state *WriteRpcState, files *Raft
 			continue
 		}
 		extCmdId, extEntryPayload, nextOff := state.msg.GetAppendEntryExtHeader(state.optOff)
-		if files != nil && extCmdId&DataCmdIdBit != 0 {
-			bodyFileId, bodyLength, bodyFileOffset := GetAppendEntryFileArgs(extEntryPayload)
-			files.lock.Lock()
-			rFd, reply := files.openCacheNoLock(bodyFileId)
-			if reply != RaftReplyOk {
-				files.lock.Unlock()
-				log.Errorf("Failed: __writeRpcMsg, openCacheNoLock, bodyFileId=%v, reply=%v", bodyFileId, reply)
-				return ReplyToFuseErr(reply)
+		if extLogger != nil && extCmdId&DataCmdIdBit != 0 {
+			bodyLogId, bodyLength, bodyOffset := GetAppendEntryExtLogArgs(extEntryPayload)
+			err := extLogger.SendZeroCopy(bodyLogId, fd, bodyOffset, bodyLength, &state.optBufOff)
+			if err != nil {
+				log.Errorf("Failed: __writeRpcMsg, SendZeroCopy, errr=%v", err)
+				return err
 			}
-			var fileOff = bodyFileOffset + int64(state.optBufOff)
-			for state.optBufOff < bodyLength {
-				sendFileBegin := time.Now()
-				n, err := unix.Sendfile(fd, rFd, &fileOff, int(bodyLength-state.optBufOff))
-				sendFileTime += time.Since(sendFileBegin)
-				if err == unix.EAGAIN || err == unix.EWOULDBLOCK {
-					files.lock.Unlock()
-					return nil
-				} else if err != nil {
-					files.lock.Unlock()
-					log.Errorf("Failed: __writeRpcMsg, Sendfile, fd=%v, fileOff=%v, extOffPair[1]=%v, bodyLength=%v, errr=%v", fd, fileOff, state.optBufOff, bodyLength, err)
-					return err
-				}
-				state.optBufOff += int32(n)
-				sendFileBytes += n
-			}
-			files.lock.Unlock()
 			if state.optBufOff == bodyLength {
 				state.optBufOff = 0
 				state.optOff = nextOff
@@ -352,8 +301,8 @@ func __writeRpcMsg(ev unix.EpollEvent, fd int, state *WriteRpcState, files *Raft
 		state.failed = nil
 	}
 	if state.completed && debug {
-		log.Debugf("Success: __writeRpcMsg, writeTime=%v (bytes=%v), writeOptTime=%v (bytes=%v), sendFileTime=%v (bytes=%v)",
-			writeTime, state.headerSentBytes, writeOptTime, state.optHeaderSentBytes, sendFileTime, sendFileBytes)
+		log.Debugf("Success: __writeRpcMsg, writeTime=%v (bytes=%v), writeOptTime=%v (bytes=%v)",
+			writeTime, state.headerSentBytes, writeOptTime, state.optHeaderSentBytes)
 	}
 	return nil
 }
@@ -402,9 +351,9 @@ func (r *EpollHandler) Close() (err error) {
 }
 
 type RpcSeqNumArgs struct {
-	data       []byte
-	fd         int
-	fileOffset int64
+	data      []byte
+	fd        int
+	logOffset int64
 }
 
 type RpcClient struct {
@@ -640,7 +589,7 @@ func (w *RpcClient) CheckReset() (ok bool) {
 	return
 }
 
-func (w *RpcClient) SendAndWait(msg RpcMsg, sa common.NodeAddrInet4, files *RaftFiles, timeout time.Duration) (replyMsg RpcMsg, err error) {
+func (w *RpcClient) SendAndWait(msg RpcMsg, sa common.NodeAddrInet4, extLogger *OnDiskLogger, timeout time.Duration) (replyMsg RpcMsg, err error) {
 	// must be in an atomic context (i.e., holding raft.hbLock)
 	var fd int
 	begin := time.Now()
@@ -649,7 +598,7 @@ func (w *RpcClient) SendAndWait(msg RpcMsg, sa common.NodeAddrInet4, files *Raft
 		log.Errorf("Failed: SendAndWait, Connect, sa=%v, err=%v", sa, err)
 		return RpcMsg{}, err
 	}
-	err = w.UnicastRpcMsg(msg, sa, files, timeout, nil, false)
+	err = w.UnicastRpcMsg(msg, sa, extLogger, timeout, nil, false)
 	msg.optBuf = nil
 	if err != nil {
 		if err != unix.ETIMEDOUT {
@@ -674,7 +623,7 @@ func (w *RpcClient) SendAndWait(msg RpcMsg, sa common.NodeAddrInet4, files *Raft
 	return replyMsg, nil
 }
 
-func (w *RpcClient) UnicastRpcMsg(msg RpcMsg, sa common.NodeAddrInet4, files *RaftFiles, timeout time.Duration, dataBuf [][]byte, debug bool) (err error) {
+func (w *RpcClient) UnicastRpcMsg(msg RpcMsg, sa common.NodeAddrInet4, extLogger *OnDiskLogger, timeout time.Duration, dataBuf [][]byte, debug bool) (err error) {
 	begin := time.Now()
 	err = nil
 	w.fdLock.RLock()
@@ -720,7 +669,7 @@ func (w *RpcClient) UnicastRpcMsg(msg RpcMsg, sa common.NodeAddrInet4, files *Ra
 					info.failed = unix.EPIPE
 					break
 				}
-				if err3 := __writeRpcMsg(ev, fd, &info, files, dataBuf, debug); err3 != nil {
+				if err3 := __writeRpcMsg(ev, fd, &info, extLogger, dataBuf, debug); err3 != nil {
 					info.failed = err3
 					break
 				}
@@ -796,7 +745,7 @@ func (w *RpcClient) BroadcastAndWaitRpcMsg(messages map[int]RpcMsg, raft *RaftIn
 					w.RemoveFd(fd)
 					continue
 				}
-				if err3 := __writeRpcMsg(events[i], fd, fdInfo, raft.files, nil, debug); err3 != nil {
+				if err3 := __writeRpcMsg(events[i], fd, fdInfo, raft.extLogger, nil, debug); err3 != nil {
 					fdInfo.failed = err3
 					fdInfo.completed = false
 					w.RemoveFd(fd)
@@ -933,7 +882,7 @@ func (w *RpcClient) WaitAndCheckRaftReply(raft *RaftInstance, servers map[int]*W
 				}
 				spliceBegin := time.Now()
 				readTime += spliceBegin.Sub(readBegin)
-				ReadDataToRaftLog(fd, &msg, &states[j], raft.files, w.pipeFds)
+				ReadDataToRaftLog(fd, &msg, &states[j], raft.extLogger, w.pipeFds)
 				beginResponseHandling := time.Now()
 				spliceTime += beginResponseHandling.Sub(spliceBegin)
 				if states[j].completed {
@@ -1151,7 +1100,7 @@ func (w *RpcClientConnectionV2) StoreRpcArgs(seqNum uint64, args *RpcSeqNumArgs)
 	}
 }
 
-func (w *RpcClientConnectionV2) SendRpcMsg(msg RpcMsg, files *RaftFiles, wakeUpInterval time.Duration, dataBuf [][]byte, doTimeout bool) (err error) {
+func (w *RpcClientConnectionV2) SendRpcMsg(msg RpcMsg, extLogger *OnDiskLogger, wakeUpInterval time.Duration, dataBuf [][]byte, doTimeout bool) (err error) {
 	w.sendLock.Lock()
 	if w.sender == nil {
 		w.sendLock.Unlock()
@@ -1209,7 +1158,7 @@ func (w *RpcClientConnectionV2) SendRpcMsg(msg RpcMsg, files *RaftFiles, wakeUpI
 				info.completed = false
 				break
 			}
-			if err3 := __writeRpcMsg(ev, fd, &info, files, dataBuf, false); err3 != nil {
+			if err3 := __writeRpcMsg(ev, fd, &info, extLogger, dataBuf, false); err3 != nil {
 				info.failed = err3
 				info.completed = false
 			}
@@ -1225,7 +1174,7 @@ func (w *RpcClientConnectionV2) SendRpcMsg(msg RpcMsg, files *RaftFiles, wakeUpI
 	return
 }
 
-func (w *RpcClientConnectionV2) WaitAndGetRpcReply(seqNum uint64, timeout time.Duration) (msg RpcMsg, err error) {
+func (w *RpcClientConnectionV2) WaitAndGetRpcReply(seqNum uint64, timeout time.Duration, enableLog bool) (msg RpcMsg, err error) {
 	begin := time.Now()
 	w.receiveCond.L.Lock()
 	var ok bool
@@ -1251,7 +1200,9 @@ func (w *RpcClientConnectionV2) WaitAndGetRpcReply(seqNum uint64, timeout time.D
 		if elapsed > timeout {
 			w.receiveCond.L.Unlock()
 			err = unix.ETIMEDOUT
-			log.Errorf("Timeout: WaitAndGetRpcReply, seqNum=%v, elapsed=%v, timeout=%v", seqNum, elapsed, timeout)
+			if enableLog {
+				log.Errorf("Timeout: WaitAndGetRpcReply, seqNum=%v, elapsed=%v, timeout=%v", seqNum, elapsed, timeout)
+			}
 			return
 		}
 	}
@@ -1277,7 +1228,9 @@ func (w *RpcClientConnectionV2) WaitAndGetRpcReply(seqNum uint64, timeout time.D
 		elapsed := time.Since(begin)
 		if !recvStarted && elapsed > timeout {
 			err = unix.ETIMEDOUT
-			log.Errorf("Timeout: WaitAndGetRpcReply, seqNum=%v, elapsed=%v, timeout=%v", seqNum, elapsed, timeout)
+			if enableLog {
+				log.Errorf("Timeout: WaitAndGetRpcReply, seqNum=%v, elapsed=%v, timeout=%v", seqNum, elapsed, timeout)
+			}
 			goto out
 		}
 		var nrEvents int
@@ -1325,13 +1278,13 @@ func (w *RpcClientConnectionV2) WaitAndGetRpcReply(seqNum uint64, timeout time.D
 				if args.data != nil {
 					ReadDataToBuffer(fd, &newMsg, &state, args.data)
 				} else if args.fd > 0 {
-					state.fileOffsetForSplice = args.fileOffset
+					state.logOffsetForSplice = args.logOffset
 					ReadDataToFd(fd, &newMsg, &state, args.fd, w.pipeFds)
 				} else {
 					state.completed = true
 				}
 				if state.failed != nil {
-					log.Errorf("Failed: WaitAndGetRpcReply, ReadDataToTempFile, err=%v", state.failed)
+					log.Errorf("Failed: WaitAndGetRpcReply, ReadDataToBuffer/ReadDataToFd, err=%v", state.failed)
 					err = state.failed
 					goto out
 				}
@@ -1431,7 +1384,7 @@ func (w *RpcClientConnectionV2) IsFree() bool {
 	return atomic.LoadInt32(&w.refCount) == 0
 }
 
-func (w *RpcClientConnectionV2) CallObjcacheRpc(extCmdId uint16, seqNum uint64, args proto.Message, timeout time.Duration, files *RaftFiles, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs, ret proto.Message) (reply int32) {
+func (w *RpcClientConnectionV2) CallObjcacheRpc(extCmdId uint16, seqNum uint64, args proto.Message, timeout time.Duration, extLogger *OnDiskLogger, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs, ret proto.Message) (reply int32) {
 	begin := time.Now()
 	msg := RpcMsg{}
 	bufLen := 0
@@ -1444,7 +1397,7 @@ func (w *RpcClientConnectionV2) CallObjcacheRpc(extCmdId uint16, seqNum uint64, 
 	}
 	fill := time.Now()
 	w.StoreRpcArgs(seqNum, rpcArgs)
-	err := w.SendRpcMsg(msg, files, timeout, dataBuf, false)
+	err := w.SendRpcMsg(msg, extLogger, timeout, dataBuf, false)
 	msg.optBuf = nil
 	if err != nil {
 		w.RemoveRpcArgs(seqNum)
@@ -1453,7 +1406,7 @@ func (w *RpcClientConnectionV2) CallObjcacheRpc(extCmdId uint16, seqNum uint64, 
 	}
 	send := time.Now()
 
-	replyMsg, err2 := w.WaitAndGetRpcReply(seqNum, timeout)
+	replyMsg, err2 := w.WaitAndGetRpcReply(seqNum, timeout, true)
 	w.RemoveRpcArgs(seqNum)
 	if err2 != nil {
 		log.Errorf("Failed: CallObjcacheRpc, WaitAndGetRpcReply, sa=%v, err2=%v", w.sa, err2)
@@ -1470,7 +1423,7 @@ func (w *RpcClientConnectionV2) CallObjcacheRpc(extCmdId uint16, seqNum uint64, 
 	return RaftReplyOk
 }
 
-func (w *RpcClientConnectionV2) CallObjcacheRpcNoTimeout(extCmdId uint16, seqNum uint64, args proto.Message, files *RaftFiles, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs, ret proto.Message) (reply int32) {
+func (w *RpcClientConnectionV2) CallObjcacheRpcNoTimeout(extCmdId uint16, seqNum uint64, args proto.Message, extLogger *OnDiskLogger, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs, ret proto.Message) (reply int32) {
 	begin := time.Now()
 	msg := RpcMsg{}
 	bufLen := 0
@@ -1485,7 +1438,7 @@ func (w *RpcClientConnectionV2) CallObjcacheRpcNoTimeout(extCmdId uint16, seqNum
 	w.StoreRpcArgs(seqNum, rpcArgs)
 	lastWarn := time.Now()
 	for {
-		err := w.SendRpcMsg(msg, files, time.Millisecond, dataBuf, false)
+		err := w.SendRpcMsg(msg, extLogger, time.Millisecond, dataBuf, false)
 		msg.optBuf = nil
 		if err == unix.ETIMEDOUT {
 			if time.Since(lastWarn).Minutes() >= 1 {
@@ -1506,7 +1459,7 @@ func (w *RpcClientConnectionV2) CallObjcacheRpcNoTimeout(extCmdId uint16, seqNum
 	lastWarn = send
 	for {
 		var err error
-		replyMsg, err = w.WaitAndGetRpcReply(seqNum, time.Millisecond*10)
+		replyMsg, err = w.WaitAndGetRpcReply(seqNum, time.Millisecond*10, false)
 		if err == unix.ETIMEDOUT {
 			if time.Since(lastWarn).Minutes() >= 1 {
 				log.Warnf("CallObjcacheRpcNoTimeout, blocking at WaitAndGetRpcReply, seqNum=%v, elapsed=%v", seqNum, time.Since(begin))
@@ -1532,7 +1485,7 @@ func (w *RpcClientConnectionV2) CallObjcacheRpcNoTimeout(extCmdId uint16, seqNum
 	return RaftReplyOk
 }
 
-func (w *RpcClientConnectionV2) AsyncObjcacheRpc(extCmdId uint16, seqNum uint64, args proto.Message, sa common.NodeAddrInet4, files *RaftFiles, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs) (reply int32) {
+func (w *RpcClientConnectionV2) AsyncObjcacheRpc(extCmdId uint16, seqNum uint64, args proto.Message, sa common.NodeAddrInet4, extLogger *OnDiskLogger, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs) (reply int32) {
 	begin := time.Now()
 	msg := RpcMsg{}
 	bufLen := 0
@@ -1546,7 +1499,7 @@ func (w *RpcClientConnectionV2) AsyncObjcacheRpc(extCmdId uint16, seqNum uint64,
 	w.StoreRpcArgs(seqNum, rpcArgs)
 	lastWarn := time.Now()
 	for {
-		err := w.SendRpcMsg(msg, files, time.Millisecond, dataBuf, false)
+		err := w.SendRpcMsg(msg, extLogger, time.Millisecond, dataBuf, false)
 		msg.optBuf = nil
 		if err == unix.ETIMEDOUT {
 			if time.Since(lastWarn).Minutes() >= 1 {
@@ -1609,7 +1562,7 @@ func (w *RpcClientV2) CheckReset() (ok bool) {
 	return
 }
 
-func (w *RpcClientV2) AsyncObjcacheRpc(extCmdId uint16, args proto.Message, sa common.NodeAddrInet4, files *RaftFiles, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs) (con *RpcClientConnectionV2, seqNum uint64, reply int32) {
+func (w *RpcClientV2) AsyncObjcacheRpc(extCmdId uint16, args proto.Message, sa common.NodeAddrInet4, extLogger *OnDiskLogger, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs) (con *RpcClientConnectionV2, seqNum uint64, reply int32) {
 	w.lock.RLock()
 	var ok bool
 	con, ok = w.sas[sa]
@@ -1636,7 +1589,7 @@ func (w *RpcClientV2) AsyncObjcacheRpc(extCmdId uint16, args proto.Message, sa c
 		w.lock.Unlock()
 	}
 	seqNum = atomic.AddUint64(&w.nextSeqNum, 1)
-	reply = con.AsyncObjcacheRpc(extCmdId, seqNum, args, sa, files, dataBuf, rpcArgs)
+	reply = con.AsyncObjcacheRpc(extCmdId, seqNum, args, sa, extLogger, dataBuf, rpcArgs)
 	if reply != RaftReplyOk && reply != ErrnoToReply(unix.ETIMEDOUT) {
 		con.Down()
 		w.lock.Lock()
@@ -1659,7 +1612,7 @@ func (w *RpcClientV2) WaitAsyncObjcacheRpc(con *RpcClientConnectionV2, seqNum ui
 	lastWarn := begin
 	for {
 		var err error
-		replyMsg, err = con.WaitAndGetRpcReply(seqNum, time.Millisecond*10)
+		replyMsg, err = con.WaitAndGetRpcReply(seqNum, time.Millisecond*10, false)
 		if err == unix.ETIMEDOUT {
 			if time.Since(lastWarn).Minutes() >= 1 {
 				log.Warnf("WaitAsyncObjcacheRpc, blocking at WaitAndGetRpcReply, seqNum=%v, elapsed=%v", seqNum, time.Since(begin))
@@ -1691,7 +1644,7 @@ func (w *RpcClientV2) WaitAsyncObjcacheRpc(con *RpcClientConnectionV2, seqNum ui
 	return reply
 }
 
-func (w *RpcClientV2) CallObjcacheRpc(extCmdId uint16, args proto.Message, sa common.NodeAddrInet4, timeout time.Duration, files *RaftFiles, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs, ret proto.Message) (reply int32) {
+func (w *RpcClientV2) CallObjcacheRpc(extCmdId uint16, args proto.Message, sa common.NodeAddrInet4, timeout time.Duration, extLogger *OnDiskLogger, dataBuf [][]byte, rpcArgs *RpcSeqNumArgs, ret proto.Message) (reply int32) {
 	w.lock.RLock()
 	var ok bool
 	con, ok := w.sas[sa]
@@ -1719,9 +1672,9 @@ func (w *RpcClientV2) CallObjcacheRpc(extCmdId uint16, args proto.Message, sa co
 	}
 	seqNum := atomic.AddUint64(&w.nextSeqNum, 1)
 	if timeout.Nanoseconds() <= 0 {
-		reply = con.CallObjcacheRpcNoTimeout(extCmdId, seqNum, args, files, dataBuf, rpcArgs, ret)
+		reply = con.CallObjcacheRpcNoTimeout(extCmdId, seqNum, args, extLogger, dataBuf, rpcArgs, ret)
 	} else {
-		reply = con.CallObjcacheRpc(extCmdId, seqNum, args, timeout, files, dataBuf, rpcArgs, ret)
+		reply = con.CallObjcacheRpc(extCmdId, seqNum, args, timeout, extLogger, dataBuf, rpcArgs, ret)
 	}
 	con.Down()
 	if reply != RaftReplyOk && reply != ErrnoToReply(unix.ETIMEDOUT) {
@@ -1784,7 +1737,7 @@ func (w *RpcReplyClient) CheckReset() (ok bool) {
 	return
 }
 
-func (w *RpcReplyClient) ReplyRpcMsg(msg RpcMsg, fd int, sa common.NodeAddrInet4, files *RaftFiles, timeout time.Duration, dataBuf [][]byte) (reply int32) {
+func (w *RpcReplyClient) ReplyRpcMsg(msg RpcMsg, fd int, sa common.NodeAddrInet4, extLogger *OnDiskLogger, timeout time.Duration, dataBuf [][]byte) (reply int32) {
 	w.lock.RLock()
 	con, ok := w.fds[fd]
 	if ok {
@@ -1795,7 +1748,7 @@ func (w *RpcReplyClient) ReplyRpcMsg(msg RpcMsg, fd int, sa common.NodeAddrInet4
 		log.Errorf("Failed: ReplyRpcMsg, connection is closed, sa=%v", sa)
 		return ErrnoToReply(unix.EPIPE)
 	}
-	err := con.SendRpcMsg(msg, files, timeout, dataBuf, true)
+	err := con.SendRpcMsg(msg, extLogger, timeout, dataBuf, true)
 	con.Down()
 	if err != nil && err != unix.ETIMEDOUT {
 		log.Errorf("Failed: ReplyRpcMsg, SendRpcMsg, sa=%v, err=%v", sa, err)
@@ -1842,87 +1795,45 @@ const (
 
 // AppendEntryHeartBeatCmdId    = uint16(0)
 const (
-	DataCmdIdBit = uint16(1 << 15)
-
-	AppendEntryNoOpCmdId                      = uint16(0)
-	AppendEntryAddServerCmdId                 = uint16(1)
-	AppendEntryRemoveServerCmdId              = uint16(2)
-	AppendEntryCommitTxCmdId                  = uint16(3)
-	AppendEntryResetExtLogCmdId               = uint16(4)
-	AppendEntryFillChunkCmdId                 = DataCmdIdBit | uint16(1)
-	AppendEntryUpdateChunkCmdId               = DataCmdIdBit | uint16(2)
-	AppendEntryUpdateMetaCmdId                = DataCmdIdBit | uint16(3)
-	AppendEntryUpdateMetaCoordinatorCmdId     = DataCmdIdBit | uint16(4)
-	AppendEntryCommitChunkCmdId               = DataCmdIdBit | uint16(5)
-	AppendEntryAbortTxCmdId                   = DataCmdIdBit | uint16(6)
-	AppendEntryPersistChunkCmdId              = DataCmdIdBit | uint16(7)
-	AppendEntryBeginPersistCmdId              = DataCmdIdBit | uint16(8)
-	AppendEntryPersistCmdId                   = DataCmdIdBit | uint16(9)
-	AppendEntryUpdateNodeListCoordinatorCmdId = DataCmdIdBit | uint16(10)
-	AppendEntryUpdateNodeListCmdId            = DataCmdIdBit | uint16(11)
-	AppendEntryUpdateNodeListLocalCmdId       = DataCmdIdBit | uint16(12)
-	AppendEntryCommitMigrationCmdId           = DataCmdIdBit | uint16(13)
-	AppendEntryCreateMetaCoordinatorCmdId     = DataCmdIdBit | uint16(14)
-	AppendEntryUpdateMetaKeyCmdId             = DataCmdIdBit | uint16(15)
-	AppendEntryRenameCoordinatorCmdId         = DataCmdIdBit | uint16(16)
-	AppendEntryCreateMetaCmdId                = DataCmdIdBit | uint16(17)
-	AppendEntryDeleteMetaCmdId                = DataCmdIdBit | uint16(18)
-	AppendEntryDeleteMetaCoordinatorCmdId     = DataCmdIdBit | uint16(19)
-	AppendEntryDeletePersistCmdId             = DataCmdIdBit | uint16(20)
-	AppendEntryUpdateParentMetaCmdId          = DataCmdIdBit | uint16(21)
-	AppendEntryAddInodeFileMapCmdId           = DataCmdIdBit | uint16(22)
-	AppendEntryDropLRUChunksCmdId             = DataCmdIdBit | uint16(23)
-	AppendEntryCreateChunkCmdId               = DataCmdIdBit | uint16(24)
-	AppendEntryUpdateMetaAttrCmdId            = DataCmdIdBit | uint16(25)
-	AppendEntryDeleteInodeFileMapCmdId        = DataCmdIdBit | uint16(26)
-	AppendEntryRemoveNonDirtyChunksCmdId      = DataCmdIdBit | uint16(27)
-	AppendEntryForgetAllDirtyLogCmdId         = DataCmdIdBit | uint16(28)
-
-	RpcGetMetaInClusterCmdId       = uint16(1)
-	RpcGetMetaCmdId                = uint16(2)
-	RpcDownloadChunkViaRemoteCmdId = uint16(3)
-	RpcPrefetchChunkCmdId          = uint16(4)
-	RpcRestoreDirtyMetasCmdId      = uint16(5)
-	RpcGetApiIpAndPortCmdId        = uint16(6)
+	RpcGetMetaCmdId           = uint16(1)
+	RpcReadChunkCmdId         = uint16(2)
+	RpcPrefetchChunkCmdId     = uint16(3)
+	RpcRestoreDirtyMetasCmdId = uint16(4)
+	RpcGetApiIpAndPortCmdId   = uint16(5)
+	RpcUpdateMetaAttrCmdId    = uint16(6)
 
 	RpcUpdateChunkCmdId        = DataCmdIdBit | uint16(10)
 	RpcRestoreDirtyChunksCmdId = DataCmdIdBit | uint16(11)
 
-	RpcCommitParticipantCmdId          = uint16(20)
-	RpcCommitMigrationParticipantCmdId = uint16(21)
-	RpcAbortParticipantCmdId           = uint16(22)
-
+	RpcCommitParticipantCmdId  = uint16(20)
+	RpcAbortParticipantCmdId   = uint16(21)
 	RpcCreateMetaCmdId         = uint16(30)
-	RpcLinkMetaCmdId           = uint16(31)
-	RpcTruncateMetaCmdId       = uint16(32)
-	RpcUpdateMetaSizeCmdId     = uint16(33)
-	RpcDeleteMetaCmdId         = uint16(34)
-	RpcUnlinkMetaCmdId         = uint16(35)
-	RpcRenameMetaCmdId         = uint16(36)
-	RpcCommitUpdateChunkCmdId  = uint16(37)
-	RpcCommitDeleteChunkCmdId  = uint16(38)
-	RpcCommitExpandChunkCmdId  = uint16(39)
-	RpcCommitPersistChunkCmdId = uint16(40)
-	RpcUpdateNodeListCmdId     = uint16(41)
-	RpcInitNodeListCmdId       = uint16(42)
-	RpcMpuAddCmdId             = uint16(43)
-	RpcJoinMigrationCmdId      = uint16(44)
-	RpcLeaveMigrationCmdId     = uint16(45)
-	RpcCreateChildMetaCmdId    = uint16(46)
-	RpcUpdateMetaKeyCmdId      = uint16(47)
-	RpcUpdateMetaAttrCmdId     = uint16(48)
-	RpcGetApiPortCmdId         = uint16(49)
+	RpcTruncateMetaCmdId       = uint16(31)
+	RpcUpdateMetaSizeCmdId     = uint16(32)
+	RpcDeleteMetaCmdId         = uint16(33)
+	RpcUnlinkMetaCmdId         = uint16(34)
+	RpcRenameMetaCmdId         = uint16(35)
+	RpcCommitUpdateChunkCmdId  = uint16(36)
+	RpcCommitDeleteChunkCmdId  = uint16(37)
+	RpcCommitExpandChunkCmdId  = uint16(38)
+	RpcCommitPersistChunkCmdId = uint16(39)
+	RpcUpdateNodeListCmdId     = uint16(40)
+	RpcFillNodeListCmdId       = uint16(41)
+	RpcMpuAddCmdId             = uint16(42)
+	RpcJoinMigrationCmdId      = uint16(43)
+	RpcLeaveMigrationCmdId     = uint16(44)
+	RpcCreateChildMetaCmdId    = uint16(45)
+	RpcUpdateMetaKeyCmdId      = uint16(46)
 
 	RpcCoordinatorUpdateNodeListCmdId = uint16(50)
-	RpcCoordinatorAbortTxCmdId        = uint16(51)
-	RpcCoordinatorFlushObjectCmdId    = uint16(52)
-	RpcCoordinatorTruncateObjectCmdId = uint16(53)
-	RpcCoordinatorDeleteObjectCmdId   = uint16(54)
-	RpcCoordinatorHardLinkObjectCmdId = uint16(55)
-	RpcCoordinatorRenameObjectCmdId   = uint16(56)
-	RpcCoordinatorCreateObjectCmdId   = uint16(57)
-	RpcCoordinatorPersistCmdId        = uint16(58)
-	RpcCoordinatorDeletePersistCmdId  = uint16(59)
+	RpcCoordinatorFlushObjectCmdId    = uint16(51)
+	RpcCoordinatorTruncateObjectCmdId = uint16(52)
+	RpcCoordinatorDeleteObjectCmdId   = uint16(53)
+	RpcCoordinatorHardLinkObjectCmdId = uint16(54)
+	RpcCoordinatorRenameObjectCmdId   = uint16(55)
+	RpcCoordinatorCreateObjectCmdId   = uint16(56)
+	RpcCoordinatorPersistCmdId        = uint16(57)
+	RpcCoordinatorDeletePersistCmdId  = uint16(58)
 )
 
 type RpcMsg struct {
@@ -1946,7 +1857,7 @@ type RpcMsg struct {
 	  -----------------------------------------------------------------
 	  optControlHeader: 0 - 7
 
-	  Data is transmitted with sendfile (file) or write (byte array) and received with splice
+	  Data is transmitted with sendfile (fd) or write (byte array) and received with splice
 	*/
 }
 
@@ -1966,10 +1877,10 @@ func (d *RpcMsg) SetCmdControlHeader(cmdId uint8, optHeaderLength uint16) {
 func (d *RpcMsg) SetOptHeaderLength(optHeaderLength uint16) {
 	binary.LittleEndian.PutUint16(d.buf[1:3], optHeaderLength)
 }
-func (d *RpcMsg) GetOptControlHeader() (totalFileLength uint32, nrEntries uint32) {
+func (d *RpcMsg) GetOptControlHeader() (totalExtLogLength uint32, nrEntries uint32) {
 	optHeaderLength := d.GetOptHeaderLength()
 	if optHeaderLength >= 4 {
-		totalFileLength = binary.LittleEndian.Uint32(d.optBuf[0:4])
+		totalExtLogLength = binary.LittleEndian.Uint32(d.optBuf[0:4])
 	}
 	if optHeaderLength >= 8 {
 		nrEntries = binary.LittleEndian.Uint32(d.optBuf[4:8])
@@ -1986,15 +1897,15 @@ func (d *RpcMsg) GetOptHeaderPayload() []byte {
 	}
 	return d.optBuf[RpcOptControlHeaderLength:optHeaderLength]
 }
-func (d *RpcMsg) SetTotalFileLength(totalFileLength uint32) {
-	binary.LittleEndian.PutUint32(d.optBuf[0:4], totalFileLength)
+func (d *RpcMsg) SetTotalExtLogLength(totalExtLogLength uint32) {
+	binary.LittleEndian.PutUint32(d.optBuf[0:4], totalExtLogLength)
 }
 func (d *RpcMsg) SetNrEntries(nrEntries uint32) {
 	binary.LittleEndian.PutUint32(d.optBuf[4:8], nrEntries)
 }
-func (d *RpcMsg) CreateOptControlHeader(totalFileLength uint32, nrEntries uint32, entryPayloadLength uint16) {
+func (d *RpcMsg) CreateOptControlHeader(totalExtLogLength uint32, nrEntries uint32, entryPayloadLength uint16) {
 	buf := make([]byte, entryPayloadLength)
-	binary.LittleEndian.PutUint32(buf[0:4], totalFileLength)
+	binary.LittleEndian.PutUint32(buf[0:4], totalExtLogLength)
 	binary.LittleEndian.PutUint32(buf[4:8], nrEntries)
 	d.optBuf = buf
 }
@@ -2029,7 +1940,7 @@ func (d *RpcMsg) FillRequestVoteResponseArgs(term uint32, voteGranted bool, repl
 	| Bytes || 0 - 3 | 4 - 4       | 5 - 8 |
 	| Name || term  | voteGranted | error |
 	---------------------------------------
-	Error bytes are used to inform critical errors such as failures during file writes
+	Error bytes are used to inform critical errors such as failures during log writes
 	*/
 	payload := d.GetCmdPayload()
 	binary.LittleEndian.PutUint32(payload[0:4], term)
@@ -2082,7 +1993,7 @@ func (d *RpcMsg) FillExecProtoBufArgs(execId uint16, seqNum uint64, m proto.Mess
 	if d.optBuf == nil || len(d.optBuf) < int(entryPayloadLength) {
 		d.CreateOptControlHeader(uint32(dataBufLen), 1, entryPayloadLength)
 	} else {
-		d.SetTotalFileLength(uint32(dataBufLen))
+		d.SetTotalExtLogLength(uint32(dataBufLen))
 		d.SetNrEntries(1)
 	}
 	copy(d.GetOptHeaderPayload(), buf) // TODO: can we eliminate copy?
@@ -2185,10 +2096,10 @@ func (d *RpcMsg) GetAppendEntryExtHeader(off uint16) (extCmdId uint16, extEntryP
 	nextOff = off + uint16(entryLength)
 	return
 }
-func GetAppendEntryFileArgs(extEntryPayload []byte) (fileId FileIdType, fileLength int32, fileOffset int64) {
-	fileId = NewFileIdTypeFromBuf(extEntryPayload[0:16])
-	fileLength = int32(binary.LittleEndian.Uint32(extEntryPayload[16:20]))
-	fileOffset = int64(binary.LittleEndian.Uint64(extEntryPayload[20:28]))
+func GetAppendEntryExtLogArgs(extEntryPayload []byte) (logId LogIdType, logLength int32, logOffset int64) {
+	logId = NewLogIdTypeFromBuf(extEntryPayload[0:16])
+	logLength = int32(binary.LittleEndian.Uint32(extEntryPayload[16:20]))
+	logOffset = int64(binary.LittleEndian.Uint64(extEntryPayload[20:28]))
 	return
 }
 func (d *RpcMsg) GetAppendEntryCommandDiskFormat(off uint16) (cmd AppendEntryCommand, nextOff uint16) {
@@ -2329,22 +2240,22 @@ func (r *EpollReader) RaftRpcThread(maxEvents int, n *NodeServer, pipeFds [2]int
 						success, cancel := raft.AppendEntriesRpcTopHalf(*msg, sa, fd)
 						topHalfTime += time.Since(topHalfBegin)
 						if success {
-							state.abortFile = false
+							state.abort = false
 						} else if cancel {
 							goto abort
 						} else {
-							state.abortFile = true
+							state.abort = true
 						}
 					}
 					spliceBegin := time.Now()
-					ReadDataToRaftLog(fd, msg, state, raft.files, pipeFds)
+					ReadDataToRaftLog(fd, msg, state, raft.extLogger, pipeFds)
 					bottomHalfBegin := time.Now()
 					spliceTime += bottomHalfBegin.Sub(spliceBegin)
 					if state.failed != nil {
 						goto abort
 					}
 					if state.completed {
-						if !state.abortFile {
+						if !state.abort {
 							e := raft.replyClient.Register(fd, sa)
 							if e != nil {
 								log.Errorf("Failed (ignore): EpollReader.RaftRpcThread, Register, fd=%v, sa=%v, err=%v", fd, sa, err)
@@ -2367,6 +2278,9 @@ func (r *EpollReader) RaftRpcThread(maxEvents int, n *NodeServer, pipeFds [2]int
 					}
 					if state.completed {
 						goto waitNext
+					}
+					if state.failed != nil {
+						goto abort
 					}
 				default:
 					log.Errorf("Failed (ignore): EpollReader.RaftRpcThread, unknown cmdId, cmdId=%v, sa=%v", cmdId, sa)
