@@ -14,8 +14,8 @@ require (
 	github.com/sirupsen/logrus v1.6.0
 	github.com/takeshi-yoshimura/fuse v0.0.0-20230810022419-2eee45af00b5
 	go.uber.org/automaxprocs v1.5.3
-	golang.org/x/net v0.21.0
-	golang.org/x/sys v0.19.0
+	golang.org/x/net v0.33.0
+	golang.org/x/sys v0.28.0
 	google.golang.org/grpc v1.63.2
 	google.golang.org/protobuf v1.33.0
 	gopkg.in/yaml.v2 v2.4.0
@@ -33,9 +33,7 @@ require (
 	github.com/konsorten/go-windows-terminal-sequences v1.0.3 // indirect
 	github.com/moby/sys/mountinfo v0.6.2 // indirect
 	github.com/spaolacci/murmur3 v1.1.0
-	golang.org/x/text v0.14.0 // indirect
-	google.golang.org/genproto v0.0.0-20240227224415-6ceb2ff114de // indirect
-	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
+	golang.org/x/text v0.21.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	k8s.io/klog/v2 v2.110.1 // indirect
 	k8s.io/utils v0.0.0-20230726121419-3b25d923346b // indirect
