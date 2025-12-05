@@ -11,7 +11,7 @@ require (
 	github.com/google/btree v1.1.2
 	github.com/kubernetes-csi/csi-lib-utils v0.12.0
 	github.com/serialx/hashring v0.0.0-20200727003509-22c0c7ab6b1b
-	github.com/sirupsen/logrus v1.6.0
+	github.com/sirupsen/logrus 1.8.3
 	github.com/takeshi-yoshimura/fuse v0.0.0-20230810022419-2eee45af00b5
 	go.uber.org/automaxprocs v1.5.3
 	golang.org/x/net v0.33.0
