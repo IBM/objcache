@@ -1,8 +1,6 @@
 module github.com/IBM/objcache
 
-go 1.21
-
-toolchain go1.21.3
+go 1.25.0
 
 require (
 	github.com/aws/aws-sdk-go v1.51.20
@@ -14,26 +12,26 @@ require (
 	github.com/sirupsen/logrus v1.8.3
 	github.com/takeshi-yoshimura/fuse v0.0.0-20230810022419-2eee45af00b5
 	go.uber.org/automaxprocs v1.5.3
-	golang.org/x/net v0.33.0
-	golang.org/x/sys v0.28.0
-	google.golang.org/grpc v1.79.3
-	google.golang.org/protobuf v1.33.0
+	golang.org/x/net v0.55.0
+	golang.org/x/sys v0.45.0
+	google.golang.org/grpc v1.82.2
+	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/apimachinery v0.26.3
 	k8s.io/mount-utils v0.29.3
 )
 
-require google.golang.org/genproto/googleapis/rpc v0.0.0-20240227224415-6ceb2ff114de // indirect
+require google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 
 require (
-	github.com/go-logr/logr v1.3.0 // indirect
+	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/konsorten/go-windows-terminal-sequences v1.0.3 // indirect
 	github.com/moby/sys/mountinfo v0.6.2 // indirect
 	github.com/spaolacci/murmur3 v1.1.0
-	golang.org/x/text v0.21.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	k8s.io/klog/v2 v2.110.1 // indirect
 	k8s.io/utils v0.0.0-20230726121419-3b25d923346b // indirect
