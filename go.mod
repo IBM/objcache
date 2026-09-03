@@ -14,7 +14,7 @@ require (
 	go.uber.org/automaxprocs v1.5.3
 	golang.org/x/net v0.55.0
 	golang.org/x/sys v0.45.0
-	google.golang.org/grpc v1.82.2
+	google.golang.org/grpc v1.83.1
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/apimachinery v0.26.3
